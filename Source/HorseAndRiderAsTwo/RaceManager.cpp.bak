@@ -1,0 +1,258 @@
+#include "RaceManager.h"
+#include "TrackActor.h"
+#include "HorseCharacter.h"
+#include "Components/SplineComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Engine/World.h"
+#include "Engine/Engine.h"
+
+// =====================================================================
+// コンストラクタ
+// =====================================================================
+ARaceManager::ARaceManager()
+{
+	PrimaryActorTick.bCanEverTick = true;
+}
+
+// =====================================================================
+// BeginPlay
+// =====================================================================
+void ARaceManager::BeginPlay()
+{
+	Super::BeginPlay();
+	StartRace();
+}
+
+// =====================================================================
+// レース開始
+// =====================================================================
+void ARaceManager::StartRace()
+{
+	NextFinishRank = 1;
+	RaceStartTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+
+	ResolveTrack();
+	CollectHorses();
+	UpdateDistances();
+	UpdateRanking();
+}
+
+// =====================================================================
+// Tick
+// =====================================================================
+void ARaceManager::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	UpdateDistances();
+	UpdateRanking();
+
+	if (bShowDebugUI)
+	{
+		DrawDebugUI();
+	}
+}
+
+// =====================================================================
+// Track をレベルから検索
+// =====================================================================
+void ARaceManager::ResolveTrack()
+{
+	if (Track) { return; }
+
+	TArray<AActor*> Found;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ATrackActor::StaticClass(), Found);
+	if (Found.Num() > 0)
+	{
+		Track = Cast<ATrackActor>(Found[0]);
+	}
+}
+
+// =====================================================================
+// 馬を全自動収集
+// =====================================================================
+void ARaceManager::CollectHorses()
+{
+	Entries.Reset();
+
+	TArray<AActor*> Found;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), AHorseCharacter::StaticClass(), Found);
+
+	for (AActor* A : Found)
+	{
+		AHorseCharacter* Horse = Cast<AHorseCharacter>(A);
+		if (!Horse) { continue; }
+
+		FRaceEntry Entry;
+		Entry.Horse = Horse;
+		Entry.LapsCompleted = 0;
+		Entry.LastInputKey = 0.0f;
+		Entry.TotalDistance = 0.0f;
+		Entries.Add(Entry);
+	}
+}
+
+// =====================================================================
+// 各馬のスプライン距離を更新
+// =====================================================================
+void ARaceManager::UpdateDistances()
+{
+	if (!Track) { return; }
+	USplineComponent* SplineComp = Track->GetSpline();
+	if (!SplineComp) { return; }
+
+	const float TrackLength = Track->GetTrackLength();
+	const int32 NumPoints = SplineComp->GetNumberOfSplinePoints();
+	const float MaxKey = SplineComp->IsClosedLoop() ? static_cast<float>(NumPoints) : static_cast<float>(NumPoints - 1);
+
+	for (FRaceEntry& E : Entries)
+	{
+		if (!E.Horse) { continue; }
+		if (E.bFinished) { continue; }
+
+		// ワールド座標 -> スプライン上の最近接点 -> 距離 (FindInputKeyClosestToWorldLocation 経由)
+		const FVector WorldLoc = E.Horse->GetActorLocation();
+		const float NewKey = SplineComp->FindInputKeyClosestToWorldLocation(WorldLoc);
+
+		// Key (浮動小数点インデックス) -> 距離 へ変換
+		E.DistanceAlongSpline = SplineComp->GetDistanceAlongSplineAtSplineInputKey(NewKey);
+
+		// 周回またぎの判定（ClosedLoop時）
+		if (SplineComp->IsClosedLoop() && MaxKey > 0.0f)
+		{
+			float KeyDiff = NewKey - E.LastInputKey;
+
+			// 急激なワープを避けるため、変化量がMaxKeyの半分以下の場合のみ通常の移動とみなす
+			if (FMath::Abs(KeyDiff) < MaxKey * 0.5f)
+			{
+				// 通常移動
+			}
+			else
+			{
+				// 境界を跨いだ判定
+				// 終端付近から始端付近へ移動 ＝ 正方向に周回
+				if (E.LastInputKey > MaxKey * 0.7f && NewKey < MaxKey * 0.3f)
+				{
+					E.LapsCompleted++;
+				}
+				// 始端付近から終端付近へ移動 ＝ 逆方向に周回
+				else if (E.LastInputKey < MaxKey * 0.3f && NewKey > MaxKey * 0.7f)
+				{
+					E.LapsCompleted--;
+				}
+			}
+		}
+
+		E.LastInputKey = NewKey;
+
+		// 累計走行距離的の更新（逆走等で一時的にマイナスになっても0以下にならないようにクランプ）
+		float CalculatedTotal = (E.LapsCompleted * TrackLength) + E.DistanceAlongSpline;
+		E.TotalDistance = FMath::Max(0.0f, CalculatedTotal);
+	}
+}
+
+// =====================================================================
+// 順位ソート
+// =====================================================================
+void ARaceManager::UpdateRanking()
+{
+	Ranking = Entries;
+
+	Ranking.Sort([](const FRaceEntry& A, const FRaceEntry& B)
+	{
+		// ゴール済みが上位、ゴール前は FinishRank が小さい順
+		if (A.bFinished && B.bFinished) { return A.FinishRank < B.FinishRank; }
+		if (A.bFinished != B.bFinished) { return A.bFinished; }
+		// 未ゴール同士は総走行距離が大きい方が上位
+		return A.TotalDistance > B.TotalDistance;
+	});
+}
+
+// =====================================================================
+// ゴール通知
+// =====================================================================
+void ARaceManager::NotifyHorseFinished(AHorseCharacter* Horse)
+{
+	if (!Horse) { return; }
+
+	for (FRaceEntry& E : Entries)
+	{
+		if (E.Horse != Horse) { continue; }
+		if (E.bFinished) { return; } // 二重ゴール防止
+
+		// 目標周回数を満たしているか確認
+		if (E.LapsCompleted < TargetLaps) { return; }
+
+		E.bFinished = true;
+		E.FinishRank = NextFinishRank++;
+		E.FinishTime = (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f) - RaceStartTime;
+
+		if (GEngine)
+		{
+			const FString Msg = FString::Printf(
+				TEXT("[Race] %s GOAL! Rank=%d Time=%.2fs"),
+				*Horse->GetName(), E.FinishRank, E.FinishTime);
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, Msg);
+		}
+
+		UpdateRanking();
+		return;
+	}
+}
+
+// =====================================================================
+// 指定馬の順位
+// =====================================================================
+int32 ARaceManager::GetRankOf(AHorseCharacter* Horse) const
+{
+	if (!Horse) { return 0; }
+	for (int32 i = 0; i < Ranking.Num(); ++i)
+	{
+		if (Ranking[i].Horse == Horse)
+		{
+			return i + 1;
+		}
+	}
+	return 0;
+}
+
+// =====================================================================
+// デバッグUI
+// =====================================================================
+void ARaceManager::DrawDebugUI() const
+{
+	if (!GEngine) { return; }
+
+	const int32 BaseKey = static_cast<int32>(GetUniqueID()) + 1000;
+
+	// ヘッダ
+	GEngine->AddOnScreenDebugMessage(BaseKey, 0.0f, FColor::White,
+		FString::Printf(TEXT("[Race] Entries=%d  TrackLength=%.0f  TargetLaps=%d"),
+			Ranking.Num(),
+			Track ? Track->GetTrackLength() : 0.0f,
+			TargetLaps));
+
+	// 各馬の情報を表示
+	for (int32 i = 0; i < Ranking.Num(); ++i)
+	{
+		const FRaceEntry& E = Ranking[i];
+		if (!E.Horse) { continue; }
+
+		const FColor Col = E.bFinished ? FColor::Yellow : FColor::White;
+		FString Line;
+		if (E.bFinished)
+		{
+			Line = FString::Printf(TEXT("  #%d %s [GOAL %.2fs] Laps=%d"),
+				i + 1, *E.Horse->GetName(), E.FinishTime, E.LapsCompleted);
+		}
+		else
+		{
+			// 逆走検知フラグがある場合は警告を追加
+			FString WrongWayStr = E.Horse->IsWrongWay() ? TEXT(" (WRONG WAY!)") : TEXT("");
+			
+			Line = FString::Printf(TEXT("  #%d %s  Lap %d/%d (Total: %.0f cm)%s"),
+				i + 1, *E.Horse->GetName(), E.LapsCompleted + 1, TargetLaps, E.TotalDistance, *WrongWayStr);
+		}
+		GEngine->AddOnScreenDebugMessage(BaseKey + 1 + i, 0.0f, Col, Line);
+	}
+}

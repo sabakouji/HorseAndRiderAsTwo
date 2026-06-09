@@ -1,0 +1,785 @@
+#include "Jockey.h"
+#include "HorseCharacter.h"
+#include "Reins.h"
+#include "RopeSimulationSpline.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/ChildActorComponent.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
+
+// =====================================================================
+// コンストラクタ
+// =====================================================================
+AJockey::AJockey()
+{
+	PrimaryActorTick.bCanEverTick = true;
+
+	// --- ルート: カプセルコンポーネント ---
+	CapsuleComp = CreateDefaultSubobject<UCapsuleComponent>(TEXT("CapsuleComp"));
+	CapsuleComp->InitCapsuleSize(34.0f, 88.0f);
+	CapsuleComp->SetCollisionProfileName(TEXT("Pawn"));
+	CapsuleComp->SetNotifyRigidBodyCollision(true); // OnHit を発火させる
+	// 馬のカメラ SpringArm に引っかからないよう Camera チャンネルを無視
+	CapsuleComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+	RootComponent = CapsuleComp;
+
+	// --- スケルタルメッシュ ---
+	MeshComp = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("MeshComp"));
+	MeshComp->SetupAttachment(CapsuleComp);
+	MeshComp->SetRelativeLocation(FVector(0.0f, 0.0f, -88.0f));
+	MeshComp->SetRelativeRotation(FRotator(0.0f, -90.0f, 0.0f));
+	MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
+	MeshComp->SetNotifyRigidBodyCollision(true);
+	// メッシュも Camera チャンネルを無視（ラグドール時もカメラに干渉させない）
+	MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+}
+
+// =====================================================================
+// BeginPlay
+// =====================================================================
+void AJockey::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// OnHit バインド
+	if (CapsuleComp)
+	{
+		CapsuleComp->OnComponentHit.AddDynamic(this, &AJockey::OnCapsuleHit);
+	}
+	if (MeshComp)
+	{
+		MeshComp->OnComponentHit.AddDynamic(this, &AJockey::OnMeshHit);
+	}
+}
+
+// =====================================================================
+// Tick — 衝撃蓄積の減衰とデバッグUI
+// =====================================================================
+void AJockey::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	// --- 蓄積値の自然減衰 ---
+	if (!bIsKnockedOut && ImpactAccumulation > 0.0f)
+	{
+		ImpactAccumulation = FMath::Max(0.0f, ImpactAccumulation - ImpactDecayRate * DeltaTime);
+	}
+
+	// --- 射出中の経過時間 ---
+	if (bLaunchedAsProjectile)
+	{
+		AirborneTime += DeltaTime;
+	}
+
+	// --- 振り回し中のスプリング拘束 ---
+	if (bIsSwinging)
+	{
+		ApplySwingSpring(DeltaTime);
+	}
+
+	// --- デバッグ表示 ---
+	if (bShowDebugUI)
+	{
+		DrawDebugUI();
+	}
+}
+
+// =====================================================================
+// 馬にアタッチ（騎乗開始）
+// =====================================================================
+void AJockey::AttachToHorse(AHorseCharacter* Horse)
+{
+	if (!Horse) { return; }
+
+	OwningHorse = Horse;
+
+	// 馬メッシュの JockeySocket にアタッチ
+	// 位置はソケットにスナップ、回転・スケールはジョッキー側設定を尊重
+	const FAttachmentTransformRules Rules(
+		EAttachmentRule::SnapToTarget,   // Location: ソケットへスナップ
+		EAttachmentRule::SnapToTarget,   // Rotation: 一旦ソケットに合わせる（直後に上書き）
+		EAttachmentRule::KeepWorld,      // Scale: ジョッキー側を維持
+		true);
+
+	USkeletalMeshComponent* HorseMesh = Horse->GetMesh();
+	if (HorseMesh)
+	{
+		AttachToComponent(HorseMesh, Rules, AttachSocketName);
+	}
+	else
+	{
+		AttachToActor(Horse, Rules);
+	}
+
+	// ジョッキー側で設定した相対回転・位置オフセットを適用
+	// （ソケットが斜めでも BP の AttachRelativeRotation で姿勢を補正できる）
+	SetActorRelativeRotation(AttachRelativeRotation);
+	SetActorRelativeLocation(AttachRelativeLocation);
+
+	// 騎乗中は Capsule のコリジョンを完全に無効化（馬の衝突挙動が安定）
+	if (CapsuleComp)
+	{
+		CapsuleComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+
+	// メッシュは部分ラグドール用に物理シムだけ有効、クエリは無効
+	// （PhysicsOnly + 全チャンネル Ignore で馬や SpringArm に干渉させない）
+	if (MeshComp)
+	{
+		if (bEnableRidingPhysicsBlend && MeshComp->GetPhysicsAsset())
+		{
+			MeshComp->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
+			MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
+		}
+		else
+		{
+			MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		}
+	}
+
+	bIsRiding = true;
+	bIsKnockedOut = false;
+	ImpactAccumulation = 0.0f;
+
+	// 騎乗中フニャフニャ（部分ラグドール）を適用
+	ApplyRidingPhysicsBlend();
+
+	// 手綱を左手へ物理結合
+	if (Horse->GetCurrentReins() && MeshComp)
+	{
+		Horse->GetCurrentReins()->AttachToJockey(MeshComp);
+	}
+
+	// Spline 縄手綱（RopeReinsChildActor）も hand_l にグリップ
+	if (MeshComp)
+	{
+		TInlineComponentArray<UChildActorComponent*> CACs(Horse);
+		for (UChildActorComponent* CAC : CACs)
+		{
+			if (!CAC) { continue; }
+			if (ARopeSimulationSpline* Rope = Cast<ARopeSimulationSpline>(CAC->GetChildActor()))
+			{
+				Rope->AttachHandGrip(MeshComp, FName("hand_l"), -1);
+				break;
+			}
+		}
+	}
+}
+
+// =====================================================================
+// 馬から切り離し（落馬）
+// =====================================================================
+void AJockey::DetachFromHorse()
+{
+	// 手綱の物理結合を切る
+	if (OwningHorse && OwningHorse->GetCurrentReins())
+	{
+		OwningHorse->GetCurrentReins()->DetachFromJockey();
+	}
+
+	// Spline 縄手綱のグリップも解除
+	if (OwningHorse)
+	{
+		TInlineComponentArray<UChildActorComponent*> CACs(OwningHorse);
+		for (UChildActorComponent* CAC : CACs)
+		{
+			if (!CAC) { continue; }
+			if (ARopeSimulationSpline* Rope = Cast<ARopeSimulationSpline>(CAC->GetChildActor()))
+			{
+				Rope->DetachHandGrip();
+				break;
+			}
+		}
+	}
+
+	// 部分ラグドール解除（フル物理に切り替える前に必須）
+	ClearRidingPhysicsBlend();
+
+	const FDetachmentTransformRules Rules(EDetachmentRule::KeepWorld, true);
+	DetachFromActor(Rules);
+
+	// Capsule のコリジョンを復帰（落下後の地面接地・通常コリジョン用）
+	if (CapsuleComp)
+	{
+		CapsuleComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	}
+
+	OwningHorse = nullptr;
+	bIsRiding = false;
+}
+
+// =====================================================================
+// 騎乗中の部分ラグドール（TABS風フニャフニャ）の適用
+// =====================================================================
+void AJockey::ApplyRidingPhysicsBlend()
+{
+	if (!bEnableRidingPhysicsBlend) { return; }
+	if (!MeshComp || !MeshComp->GetPhysicsAsset()) { return; }
+
+	// 指定ボーン以下を物理シミュレーション対象にする
+	MeshComp->SetAllBodiesBelowSimulatePhysics(RidingSimulateBelowBoneName, true, true);
+	// アニメーションと物理のブレンド
+	MeshComp->SetAllBodiesBelowPhysicsBlendWeight(RidingSimulateBelowBoneName, RidingPhysicsBlendWeight);
+	// ブレンドフラグ有効
+	MeshComp->SetEnablePhysicsBlending(true);
+}
+
+// =====================================================================
+// 部分ラグドール解除
+// =====================================================================
+void AJockey::ClearRidingPhysicsBlend()
+{
+	if (!MeshComp || !MeshComp->GetPhysicsAsset()) { return; }
+
+	// 全ボディを物理 OFF に戻す（ラグドール化前に必須）
+	MeshComp->SetAllBodiesBelowSimulatePhysics(RidingSimulateBelowBoneName, false, true);
+	MeshComp->SetAllBodiesBelowPhysicsBlendWeight(RidingSimulateBelowBoneName, 0.0f);
+}
+
+// =====================================================================
+// ChildActorComponent 経由のセットアップ
+// =====================================================================
+void AJockey::SetupAsChildActor(AHorseCharacter* Horse)
+{
+	if (!Horse) { return; }
+	OwningHorse = Horse;
+
+	// コリジョン設定（AttachToHorse と同等の状態へ）
+	if (CapsuleComp)
+	{
+		CapsuleComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+	if (MeshComp)
+	{
+		if (bEnableRidingPhysicsBlend && MeshComp->GetPhysicsAsset())
+		{
+			MeshComp->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
+			MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
+		}
+		else
+		{
+			MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		}
+	}
+
+	bIsRiding = true;
+	bIsKnockedOut = false;
+	ImpactAccumulation = 0.0f;
+
+	// 部分ラグドール適用
+	ApplyRidingPhysicsBlend();
+
+	// 手綱を左手へ物理結合
+	if (Horse->GetCurrentReins() && MeshComp)
+	{
+		Horse->GetCurrentReins()->AttachToJockey(MeshComp);
+	}
+
+	// Spline 縄手綱も hand_l にグリップ
+	if (MeshComp)
+	{
+		TInlineComponentArray<UChildActorComponent*> CACs(Horse);
+		for (UChildActorComponent* CAC : CACs)
+		{
+			if (!CAC) { continue; }
+			if (ARopeSimulationSpline* Rope = Cast<ARopeSimulationSpline>(CAC->GetChildActor()))
+			{
+				Rope->AttachHandGrip(MeshComp, FName("hand_l"), -1);
+				break;
+			}
+		}
+	}
+}
+
+// =====================================================================
+// 落馬から復帰して再騎乗
+// =====================================================================
+void AJockey::WakeUpAndRide(AHorseCharacter* Horse)
+{
+	if (!Horse) { return; }
+
+	// 1. メッシュの物理シミュレーションを停止
+	if (MeshComp)
+	{
+		MeshComp->SetAllBodiesSimulatePhysics(false);
+		MeshComp->SetSimulatePhysics(false);
+		MeshComp->PutAllRigidBodiesToSleep();
+		MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
+
+		// メッシュ位置をコンポーネント基準にリセット（アタッチ後の見た目を整える）
+		MeshComp->SetRelativeLocation(FVector(0.0f, 0.0f, -88.0f));
+		MeshComp->SetRelativeRotation(FRotator(0.0f, -90.0f, 0.0f));
+	}
+
+	// 2. 状態リセット
+	bIsKnockedOut = false;
+	ImpactAccumulation = 0.0f;
+
+	// 3. 馬に再アタッチ（カプセルコリジョンも内部で QueryOnly に戻る）
+	AttachToHorse(Horse);
+
+	// 4. 手綱を初期形状（首後ろ周り）にリセット
+	if (Horse->GetCurrentReins())
+	{
+		Horse->GetCurrentReins()->ResetCables();
+	}
+}
+
+// =====================================================================
+// 外部衝撃の受信（馬→ジョッキー伝搬用）
+// =====================================================================
+void AJockey::ReceiveExternalImpact(float ImpactMagnitude)
+{
+	if (bIsKnockedOut) { return; }
+	AddImpact(ImpactMagnitude * HorseImpactTransferRatio);
+}
+
+// =====================================================================
+// 衝撃を加算し、閾値を超えれば落馬
+// =====================================================================
+void AJockey::AddImpact(float ImpactMagnitude)
+{
+	if (bIsKnockedOut) { return; }
+
+	ImpactAccumulation += ImpactMagnitude;
+
+	if (ImpactAccumulation >= ImpactThreshold)
+	{
+		EnterRagdollState();
+	}
+}
+
+// =====================================================================
+// ラグドール状態へ移行
+// =====================================================================
+void AJockey::EnterRagdollState()
+{
+	if (bIsKnockedOut) { return; }
+
+	// 1. 馬から切り離す
+	if (bIsRiding)
+	{
+		DetachFromHorse();
+	}
+
+	// 2. カプセルの衝突を無効化（メッシュ物理に委譲）
+	if (CapsuleComp)
+	{
+		CapsuleComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+
+	// 3. メッシュ全体を物理シミュレーションへ
+	if (MeshComp && MeshComp->GetPhysicsAsset())
+	{
+		// 騎乗中に NoCollision にしていたメッシュ衝突を復帰
+		MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		MeshComp->SetCollisionProfileName(TEXT("Ragdoll"));
+		// Camera チャンネルは引き続き無視（落下中もカメラに干渉させない）
+		MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+		MeshComp->SetSimulatePhysics(true);
+		MeshComp->SetAllBodiesSimulatePhysics(true);
+		MeshComp->WakeAllRigidBodies();
+
+		// 4. 落馬方向にインパルスを与える（後方斜め上）
+		const FVector ImpulseDir = -GetActorForwardVector() + FVector(0.0f, 0.0f, 1.0f);
+		MeshComp->AddImpulse(ImpulseDir.GetSafeNormal() * KnockoffImpulseStrength, NAME_None, true);
+	}
+
+	bIsKnockedOut = true;
+}
+
+// =====================================================================
+// デバッグ: 強制ラグドール
+// =====================================================================
+void AJockey::ForceRagdoll()
+{
+	if (bIsKnockedOut) { return; }
+
+	// 蓄積値を閾値まで一気に上げてからラグドール（UI 表示も整合）
+	ImpactAccumulation = ImpactThreshold;
+	EnterRagdollState();
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Magenta,
+			TEXT("[Jockey][Debug] ForceRagdoll triggered"));
+	}
+}
+
+// =====================================================================
+// メッシュ衝突 (ラグドール時の衝撃で再衝撃は不要、ログ目的のみ)
+// =====================================================================
+void AJockey::OnMeshHit(UPrimitiveComponent* HitComponent,
+	AActor* OtherActor,
+	UPrimitiveComponent* OtherComp,
+	FVector NormalImpulse,
+	const FHitResult& Hit)
+{
+	// 射出中のジョッキーが地面 or 障害物に着弾 → 爆発
+	if (bLaunchedAsProjectile
+		&& AirborneTime >= MinAirborneBeforeLanding
+		&& NormalImpulse.Size() >= LandingMinNormalImpulse)
+	{
+		bLaunchedAsProjectile = false;
+		TriggerExplosion(Hit.ImpactPoint);
+	}
+}
+
+// =====================================================================
+// カプセル衝突 — 騎乗中にジョッキー本人が衝突した場合の蓄積
+// =====================================================================
+void AJockey::OnCapsuleHit(UPrimitiveComponent* HitComponent,
+	AActor* OtherActor,
+	UPrimitiveComponent* OtherComp,
+	FVector NormalImpulse,
+	const FHitResult& Hit)
+{
+	if (bIsKnockedOut) { return; }
+
+	const float Magnitude = NormalImpulse.Size();
+	if (Magnitude > 0.0f)
+	{
+		AddImpact(Magnitude);
+
+		// 手綱へ衝撃を伝搬（閾値超で手綱が外れる）
+		if (OwningHorse && OwningHorse->GetCurrentReins())
+		{
+			OwningHorse->GetCurrentReins()->AddImpactToReins(Magnitude);
+		}
+	}
+}
+
+// =====================================================================
+// デバッグUI
+// =====================================================================
+void AJockey::DrawDebugUI()
+{
+	if (!GEngine) { return; }
+
+	const float Ratio = (ImpactThreshold > 0.0f)
+		? FMath::Clamp(ImpactAccumulation / ImpactThreshold, 0.0f, 1.0f)
+		: 0.0f;
+
+	FColor TextColor = FColor::Green;
+	FString StateLabel = TEXT("Normal");
+
+	if (bIsKnockedOut)
+	{
+		TextColor = FColor::Red;
+		StateLabel = TEXT("KnockedOut (Ragdoll)");
+	}
+	else if (Ratio >= 0.7f)
+	{
+		TextColor = FColor::Yellow;
+		StateLabel = TEXT("Warning");
+	}
+
+	const FString Msg = FString::Printf(
+		TEXT("[Jockey] State: %s | Impact: %.0f / %.0f (%.0f%%)"),
+		*StateLabel,
+		ImpactAccumulation,
+		ImpactThreshold,
+		Ratio * 100.0f);
+
+	// キーを Actor の UniqueID にすることで複数ジョッキーが共存可能
+	GEngine->AddOnScreenDebugMessage(
+		static_cast<int32>(GetUniqueID()),
+		0.0f,
+		TextColor,
+		Msg);
+}
+
+// =====================================================================
+// 射出（プレイヤー能動: 急ブレーキ等）
+// =====================================================================
+void AJockey::LaunchAsProjectile(const FVector& InitialVelocity)
+{
+	// 騎乗中なら馬から切り離し、ラグドール化を経由する
+	if (bIsRiding)
+	{
+		DetachFromHorse();
+	}
+
+	// ラグドール状態へ強制移行（蓄積マックスで EnterRagdollState）
+	if (!bIsKnockedOut)
+	{
+		ImpactAccumulation = ImpactThreshold;
+		EnterRagdollState();
+	}
+
+	// EnterRagdollState 直後のインパルスを上書きする形で射出速度を付与
+	if (MeshComp && MeshComp->GetPhysicsAsset())
+	{
+		// 既存の速度をリセットしてから射出速度を設定
+		MeshComp->SetAllPhysicsLinearVelocity(InitialVelocity);
+	}
+
+	bLaunchedAsProjectile = true;
+	AirborneTime = 0.0f;
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Orange,
+			FString::Printf(TEXT("[Jockey] LaunchAsProjectile v=%s"), *InitialVelocity.ToString()));
+	}
+}
+
+// =====================================================================
+// 着弾爆発（範囲内全ジョッキーの衝撃蓄積をマックス化）
+// =====================================================================
+void AJockey::TriggerExplosion(const FVector& Location)
+{
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	const float R2 = ExplosionRadius * ExplosionRadius;
+
+	// 範囲内のすべての AJockey を走査
+	for (TActorIterator<AJockey> It(World); It; ++It)
+	{
+		AJockey* Other = *It;
+		if (!Other) { continue; }
+
+		const float DSq = FVector::DistSquared(Location, Other->GetActorLocation());
+		if (DSq > R2) { continue; }
+
+		// 既にラグドール化している（自分含む）なら蓄積処理はスキップし、メッシュにインパルスのみ与える
+		if (!Other->bIsKnockedOut)
+		{
+			Other->ImpactAccumulation = Other->ImpactThreshold;
+			Other->EnterRagdollState();
+		}
+
+		// 爆発インパルス（中心から外向き＋上）
+		if (Other->MeshComp && Other->MeshComp->GetPhysicsAsset())
+		{
+			FVector Dir = Other->GetActorLocation() - Location;
+			if (Dir.IsNearlyZero())
+			{
+				Dir = FVector(0.0f, 0.0f, 1.0f);
+			}
+			Dir = Dir.GetSafeNormal() + FVector(0.0f, 0.0f, 0.5f);
+			Other->MeshComp->AddImpulse(Dir.GetSafeNormal() * ExplosionImpulseStrength, NAME_None, true);
+		}
+	}
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Red,
+			FString::Printf(TEXT("[Jockey] Explosion @ %s (r=%.0f)"), *Location.ToString(), ExplosionRadius));
+	}
+}
+
+// =====================================================================
+// 振り回しモード
+// =====================================================================
+void AJockey::EnterSwingMode(USceneComponent* InAnchorComp, FName InAnchorSocket)
+{
+	if (bIsSwinging) { return; }
+
+	// 騎乗中ならソケットから detach（手綱グリップは維持するため、
+	// DetachFromHorse は使わず最低限の処理に留める）
+	AHorseCharacter* HorseRef = OwningHorse;
+	if (bIsRiding)
+	{
+		// 部分ラグドール解除（フル物理に切り替える前に必須）
+		ClearRidingPhysicsBlend();
+
+		const FDetachmentTransformRules Rules(EDetachmentRule::KeepWorld, true);
+		DetachFromActor(Rules);
+
+		if (CapsuleComp)
+		{
+			CapsuleComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		}
+		bIsRiding = false;
+	}
+
+	// 既存の Reins (Skeletal) は切る (Rope の HandGrip は維持)
+	if (HorseRef && HorseRef->GetCurrentReins())
+	{
+		HorseRef->GetCurrentReins()->DetachFromJockey();
+	}
+
+	// メッシュ全体を物理シミュレーションへ（KnockoffImpulse は与えない＝騎乗位置からそのまま）
+	if (MeshComp && MeshComp->GetPhysicsAsset())
+	{
+		MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		MeshComp->SetCollisionProfileName(TEXT("Ragdoll"));
+		MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+		MeshComp->SetSimulatePhysics(true);
+		MeshComp->SetAllBodiesSimulatePhysics(true);
+		MeshComp->WakeAllRigidBodies();
+	}
+
+	SwingAnchorComp = InAnchorComp;
+	SwingAnchorSocket = InAnchorSocket;
+	bIsSwinging = true;
+
+	// アンカー世界速度算出用の前フレームキャッシュを初期化
+	PrevSwingAnchorWorld = ResolveSwingAnchorWorld();
+	bSwingAnchorPrevValid = true;
+
+	// Stretch 成長レート制限用キャッシュを初期化
+	PrevSwingStretch = 0.0f;
+	bSwingPrevStretchValid = false;
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan,
+			TEXT("[Jockey] EnterSwingMode"));
+	}
+}
+
+void AJockey::ExitSwingMode()
+{
+	if (!bIsSwinging) { return; }
+
+	bIsSwinging = false;
+	SwingAnchorComp = nullptr;
+	SwingAnchorSocket = NAME_None;
+	bSwingAnchorPrevValid = false;
+	PrevSwingAnchorWorld = FVector::ZeroVector;
+	bSwingPrevStretchValid = false;
+	PrevSwingStretch = 0.0f;
+
+	// 通常の KnockedOut 状態として扱う（ピックアップで復帰可能）
+	bIsKnockedOut = true;
+
+	// 縄のハンドグリップを解除（落ちる）
+	if (OwningHorse)
+	{
+		TInlineComponentArray<UChildActorComponent*> CACs(OwningHorse);
+		for (UChildActorComponent* CAC : CACs)
+		{
+			if (!CAC) { continue; }
+			if (ARopeSimulationSpline* Rope = Cast<ARopeSimulationSpline>(CAC->GetChildActor()))
+			{
+				Rope->DetachHandGrip();
+				break;
+			}
+		}
+	}
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan,
+			TEXT("[Jockey] ExitSwingMode"));
+	}
+}
+
+// =====================================================================
+// アンカー世界位置の解決 (ソケット優先)
+// =====================================================================
+FVector AJockey::ResolveSwingAnchorWorld() const
+{
+	if (!SwingAnchorComp) { return FVector::ZeroVector; }
+	if (!SwingAnchorSocket.IsNone() && SwingAnchorComp->DoesSocketExist(SwingAnchorSocket))
+	{
+		return SwingAnchorComp->GetSocketLocation(SwingAnchorSocket);
+	}
+	return SwingAnchorComp->GetComponentLocation();
+}
+
+// =====================================================================
+// 振り回し拘束 — 力ベース PD 制御 (バネ-ダンパー + 力上限クランプ)
+//
+// 設計意図:
+//   旧 SetPhysicsLinearVelocity 方式は速度を毎Tick上書きするため物理エンジンが
+//   計算した自然な加速度が消去され「もっさり」とした挙動になっていた。
+//   本実装は AddForce による力ベース PD 制御に戻し、PhysicsAsset 制約と協調する
+//   軽快なフレイル挙動を取り戻す。無限加速は以下3つのクランプで物理的に断つ:
+//
+//   1. Stretch クランプ (SwingMaxExcess): F = k*Stretch の発散源を頭打ちにする
+//   2. 力の絶対上限 (SwingMaxForce):       合成力の大きさを最終クランプ
+//   3. アンカー基準の相対速度で減衰:        馬の運動成分で誤減衰せず安定
+//
+//   また bUseAnchorVelocityTracking 有効時はアンカー速度を相対速度算出に使用し、
+//   馬が動いている定常状態でも Damping が暴れない (= 静止系基準では馬の速度が
+//   そのまま v_radial に乗ってしまい減衰挙動が破綻する問題を回避)。
+// =====================================================================
+void AJockey::ApplySwingSpring(float DeltaTime)
+{
+	if (!MeshComp || !SwingAnchorComp) { return; }
+	if (!MeshComp->GetPhysicsAsset()) { return; }
+	if (DeltaTime <= KINDA_SMALL_NUMBER) { return; }
+
+	// アンカー世界位置を解決
+	const FVector AnchorWorld = ResolveSwingAnchorWorld();
+
+	// アンカー世界速度 (馬の動き)
+	FVector AnchorVel = FVector::ZeroVector;
+	if (bUseAnchorVelocityTracking && bSwingAnchorPrevValid)
+	{
+		const FVector AnchorMove = AnchorWorld - PrevSwingAnchorWorld;
+		if (AnchorMove.Size() <= SwingMaxAnchorTeleportDist)
+		{
+			AnchorVel = AnchorMove / DeltaTime;
+		}
+	}
+
+	// ハンド骨の現在位置・速度
+	const FVector HandWorld = MeshComp->GetBoneLocation(SwingHandBoneName, EBoneSpaces::WorldSpace);
+	const FVector HandVel   = MeshComp->GetPhysicsLinearVelocity(SwingHandBoneName);
+
+	const FVector Delta = AnchorWorld - HandWorld; // Hand → Anchor 方向 (引き戻し方向)
+	const float Dist = Delta.Size();
+
+	// 自然長を超えたときのみバネ力を加える (内側では自由スイング)
+	if (Dist > SwingRestLength && Dist > KINDA_SMALL_NUMBER)
+	{
+		const FVector InwardDir = Delta / Dist; // Hand→Anchor の引き戻し方向
+
+		// Stretch クランプ — バネ力発散の頭打ち
+		const float StretchRaw = Dist - SwingRestLength;
+		float Stretch = FMath::Min(StretchRaw, SwingMaxExcess);
+
+		// 【Stretch 成長レート制限】旋回などでアンカーが急動した際の
+		// Stretch 跳ね上がりを抑え、バネ力の突発発生を緩和する。
+		// 直進・通常スイングでは制限に引っかからないため挙動に影響しない。
+		if (bSwingPrevStretchValid)
+		{
+			const float MaxGrowth = SwingMaxStretchGrowthRate * DeltaTime;
+			const float Growth = Stretch - PrevSwingStretch;
+			if (Growth > MaxGrowth)
+			{
+				Stretch = PrevSwingStretch + MaxGrowth;
+			}
+		}
+		PrevSwingStretch = Stretch;
+		bSwingPrevStretchValid = true;
+
+		// アンカー基準の相対速度の半径方向成分 (正=内向き、負=外向き)
+		// 馬が走っていても AnchorVel を引くことで Damping が誤動作しない
+		const FVector RelativeVel = HandVel - AnchorVel;
+		const float VelRadial = FVector::DotProduct(RelativeVel, InwardDir);
+
+		// バネ-ダンパー力: F = (k * Stretch - c * v_radial) を Hand→Anchor 方向に
+		const float SpringMag  = Stretch  * SwingStiffness;
+		const float DampingMag = VelRadial * SwingDamping;
+		FVector Force = InwardDir * (SpringMag - DampingMag);
+
+		// 力の絶対上限クランプ — 無限加速を物理的に断つ最後の砦
+		const float ForceMag = Force.Size();
+		if (ForceMag > SwingMaxForce && ForceMag > KINDA_SMALL_NUMBER)
+		{
+			Force *= (SwingMaxForce / ForceMag);
+		}
+
+		// AddForce(bAccelChange=false): F は実物理力として加算 (質量考慮)
+		MeshComp->AddForce(Force, SwingHandBoneName, false);
+	}
+	else
+	{
+		// 拘束圏外 (自由スイング中) は Stretch=0 として記録。
+		// 次回拘束突入時に古い値が残るとレート制限が誤動作するためリセットする。
+		PrevSwingStretch = 0.0f;
+		bSwingPrevStretchValid = true;
+	}
+
+	// 前フレームキャッシュ更新 (Dist が自然長以内でも継続して計測)
+	PrevSwingAnchorWorld = AnchorWorld;
+	bSwingAnchorPrevValid = true;
+}
