@@ -1,0 +1,25 @@
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Unreal Engine
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+*_BuiltData.uasset
+
+# Visual Studio
+.vs/
+*.sln
+*.suo
+*.vcxproj*
+*.VC.db
+*.VC.opendb
+
+# Rider
+.idea/
+
+# Local config
+*.log
