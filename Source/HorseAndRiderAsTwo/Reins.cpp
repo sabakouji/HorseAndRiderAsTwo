@@ -28,7 +28,7 @@ namespace
 	}
 
 	/** PhysicsAsset に対象ボーンの物理ボディが存在するか */
-	bool HasPhysicsBody(const USkeletalMeshComponent* Mesh, FName BoneName)
+	static inline bool HasPhysicsBody(const USkeletalMeshComponent* Mesh, FName BoneName)
 	{
 		if (!Mesh || BoneName.IsNone()) { return false; }
 		const UPhysicsAsset* PA = Mesh->GetPhysicsAsset();
