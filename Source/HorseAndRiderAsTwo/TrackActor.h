@@ -11,6 +11,23 @@ class UChildActorComponent;
 class AGoalTrigger;
 class ACheckpointActor;
 
+/** 開始演出カメラ1カットの方向（IntroCameraShots に順番に積む） */
+UENUM(BlueprintType)
+enum class ECameraIntroShot : uint8
+{
+	LeftSide  UMETA(DisplayName = "左側面"),
+	RightSide UMETA(DisplayName = "右側面"),
+	Front     UMETA(DisplayName = "正面")
+};
+
+/** 正面演出カメラの動かし方 */
+UENUM(BlueprintType)
+enum class ECameraIntroFrontMove : uint8
+{
+	HorizontalRightToLeft UMETA(DisplayName = "水平(右馬→左馬)"),
+	PullBackFromRight      UMETA(DisplayName = "引き(右馬から後退)")
+};
+
 /**
  * ATrackActor
  * USplineComponent をルートに持ち、スプラインの各セグメントに USplineMeshComponent を
@@ -76,6 +93,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Track|Race")
 	TArray<ACheckpointActor*> GetSpawnedCheckpoints() const;
 
+	// --- 開始演出カメラ設定の Getter（IntroCameraDirector から参照） ---
+	const TArray<ECameraIntroShot>& GetIntroCameraShots() const { return IntroCameraShots; }
+	ECameraIntroFrontMove GetIntroFrontMove() const { return IntroFrontMove; }
+	float GetIntroSideDistance() const { return IntroSideDistance; }
+	float GetIntroFrontDistance() const { return IntroFrontDistance; }
+	float GetIntroCameraHeight() const { return IntroCameraHeight; }
+	float GetIntroSidePanDuration() const { return IntroSidePanDuration; }
+	float GetIntroFrontMoveDuration() const { return IntroFrontMoveDuration; }
+	float GetIntroPullBackDistance() const { return IntroPullBackDistance; }
+	float GetIntroLookHeight() const { return IntroLookHeight; }
+
 protected:
 	/** エディタ上で Spline を編集すると呼ばれ、SplineMesh を再生成する */
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -83,6 +111,14 @@ protected:
 	/** ルート: スプライン */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Track", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USplineComponent> Spline;
+
+	/** コースをループさせるか。true で終端と始端を接続して閉じる。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track")
+	bool bClosedLoop = false;
+
+	/** スプライン全体の補間方式。true=直線(Linear/ポリライン)、false=ベジエ曲線(Curve)。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track")
+	bool bLinearSpline = false;
 
 	/** 各セグメントに沿わせる道メッシュ（板状の Static Mesh を推奨） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track")
@@ -146,6 +182,51 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|Race",
 		meta = (EditCondition = "bAutoSpawnGoalAndCheckpoints"))
 	TSubclassOf<ACheckpointActor> CheckpointClass;
+
+	/** Goal/Checkpoint 判定ボックスの横幅倍率（コース幅に対する比率。1.3 = コース幅の130%）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|Race",
+		meta = (EditCondition = "bAutoSpawnGoalAndCheckpoints", ClampMin = "0.1"))
+	float TriggerWidthScale = 1.3f;
+
+	// =====================================================================
+	// 開始演出カメラ設定（IntroCameraDirector が参照）
+	// =====================================================================
+
+	/** 演出カメラのカット列。先頭から順に再生し、各カットは即座に切り替わる（ブレンドなし）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera")
+	TArray<ECameraIntroShot> IntroCameraShots = { ECameraIntroShot::RightSide, ECameraIntroShot::Front };
+
+	/** 正面カットの動かし方（Front カットで有効） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera")
+	ECameraIntroFrontMove IntroFrontMove = ECameraIntroFrontMove::HorizontalRightToLeft;
+
+	/** 側面カメラのコース横方向オフセット(cm) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera", meta = (ClampMin = "0.0"))
+	float IntroSideDistance = 700.0f;
+
+	/** 正面カメラの前方距離(cm、グリッド前方へどれだけ離すか) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera", meta = (ClampMin = "0.0"))
+	float IntroFrontDistance = 600.0f;
+
+	/** 演出カメラの高さ(cm) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera")
+	float IntroCameraHeight = 200.0f;
+
+	/** 注視点の高さ(cm、馬を見上げ/見下げる調整) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera")
+	float IntroLookHeight = 100.0f;
+
+	/** 側面パン（最後尾→先頭）の所要秒 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera", meta = (ClampMin = "0.1"))
+	float IntroSidePanDuration = 2.5f;
+
+	/** 正面移動（水平 or 引き）の所要秒 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera", meta = (ClampMin = "0.1"))
+	float IntroFrontMoveDuration = 2.5f;
+
+	/** 引き演出の終端で追加で後退する距離(cm) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Track|IntroCamera", meta = (ClampMin = "0.0"))
+	float IntroPullBackDistance = 800.0f;
 
 private:
 	/**

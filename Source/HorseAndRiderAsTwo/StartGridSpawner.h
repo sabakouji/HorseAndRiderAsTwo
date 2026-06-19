@@ -48,9 +48,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|Grid")
 	TSubclassOf<AHorseCharacter> HorseClass;
 
-	/** true: レベル内の既存馬を再配置 / false: HorseClass で新規スポーン */
+	/** true: レベル内の既存馬を再配置 / false: HorseClass で新規スポーン（統一スポーンモード） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|Grid")
 	bool bRespawnExisting = true;
+
+	/**
+	 * 新規スポーンモード（bRespawnExisting=false）時に PlayerController[0] へ Possess させる
+	 * グリッドインデックス。0 = 最後尾（スプライン上で最も後ろ）が先頭グリッド。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|Grid",
+		meta = (EditCondition = "!bRespawnExisting", ClampMin = "0"))
+	int32 PlayerSlotIndex = 0;
 
 	/**
 	 * スポーン時に下向きライントレースで路面を検出し、カプセル下端が路面に乗るよう
@@ -89,6 +97,9 @@ protected:
 private:
 	/** Track 未指定時にレベルから自動取得 */
 	void ResolveTrack();
+
+	/** プレイヤー所有以外の馬を AI 化し、個体差プロファイルを初期化する（ソロ構成の自動化） */
+	void AssignAIToNonPlayers();
 
 	/**
 	 * スプライン上の配置候補位置 SpawnLoc に対し、路面に着地させた最終位置を返す。

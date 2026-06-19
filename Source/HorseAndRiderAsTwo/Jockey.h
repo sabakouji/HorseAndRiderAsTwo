@@ -6,6 +6,7 @@
 
 class UCapsuleComponent;
 class USkeletalMeshComponent;
+class UPhysicsConstraintComponent;
 class AHorseCharacter;
 
 /**
@@ -54,6 +55,12 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Jockey")
 	void ReceiveExternalImpact(float ImpactMagnitude);
+
+	/**
+	 * 方向付きで外部衝撃を受け取る。落馬時、衝撃を受けた方向（ImpactWorldDir）へ吹っ飛ぶ。
+	 * ImpactWorldDir は「衝撃が押し出す向き」（攻撃側→被弾側など）のワールド方向。
+	 */
+	void ReceiveExternalImpact(float ImpactMagnitude, const FVector& ImpactWorldDir);
 
 	/** 騎乗中か */
 	UFUNCTION(BlueprintCallable, Category = "Jockey")
@@ -107,6 +114,35 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Jockey|Swing")
 	bool IsSwinging() const { return bIsSwinging; }
 
+	/**
+	 * 鞍ラグドール騎乗を開始する。
+	 * - ジョッキーメッシュを完全ラグドール化（全身物理）
+	 * - 鞍ソケット位置へ PhysicsConstraint（SetupSeatConstraint）で繋ぎ留める
+	 * - 馬メッシュと物理接触するコリジョンを有効化
+	 * - 手綱グリップを維持
+	 * @param Horse 騎乗先の馬
+	 * @param bAttachActorToSeat true でアクタールートを鞍ソケットへ再アタッチ（再騎乗時）
+	 */
+	void BeginRideAsRagdoll(AHorseCharacter* Horse, bool bAttachActorToSeat);
+
+	/**
+	 * ヘッドバンキング攻撃: 上体ボーンへ横方向インパルスを与えて振る。
+	 * @param Direction 振る向き（+1=右 / -1=左）
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Jockey|Attack")
+	void DoHeadbang(float Direction);
+
+	/**
+	 * 攻撃判定の有効/無効を設定する。
+	 * 馬が強く傾いている間 true にすると、その間の相手ジョッキーとの接触を攻撃として扱う。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Jockey|Attack")
+	void SetHeadbangActive(bool bActive);
+
+	/** ジョッキー実体（pelvis ボーン）のワールド位置。ピックアップ距離判定に使用 */
+	UFUNCTION(BlueprintCallable, Category = "Jockey")
+	FVector GetBodyWorldLocation() const;
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -121,6 +157,13 @@ protected:
 	/** スケルタルメッシュ（ラグドール用） */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USkeletalMeshComponent> MeshComp;
+
+	/**
+	 * 初期（騎乗）状態のメッシュ相対トランスフォーム。BeginPlay でキャッシュする。
+	 * 再騎乗（ピックアップ）時にラグドールで散らばったメッシュをこの姿勢へ戻し、
+	 * 初期と同じ着座位置・ポーズから着座ラグドールを再開するために使用する。
+	 */
+	FTransform InitialMeshRelativeTransform = FTransform::Identity;
 
 	// =====================================================================
 	// アタッチ設定
@@ -165,6 +208,14 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Impact",
 		meta = (ClampMin = "0.0"))
 	float HorseImpactTransferRatio = 1.0f;
+
+	/**
+	 * 衝撃計上の不応期(秒)。1回の衝突で複数フレーム・複数経路から多重計上されるのを防ぐ。
+	 * この秒数内に届いた追加の衝撃は無視し、「1回の衝突につき1回」だけ蓄積する。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Impact",
+		meta = (ClampMin = "0.0"))
+	float ImpactHitRefractory = 0.3f;
 
 	// =====================================================================
 	// 騎乗中の部分ラグドール（TABS風フニャフニャ）
@@ -300,6 +351,105 @@ protected:
 		meta = (ClampMin = "0.0"))
 	float SwingMaxStretchGrowthRate = 300.0f;
 
+	// =====================================================================
+	// 鞍ラグドール騎乗（完全ラグドールを PhysicsConstraint で鞍へ拘束）
+	// =====================================================================
+
+	/** 鞍アンカー: 馬メッシュ上の着座ソケット名（拘束位置の基準） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding")
+	FName SeatAnchorSocketName = FName("JockeySocket");
+
+	/** 鞍へ拘束するジョッキー側ボーン（通常 pelvis） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding")
+	FName SeatBoneName = FName("pelvis");
+
+	/** 着座拘束の角度スイング上限 (deg)。上体の傾きの許容範囲。大きいほどフニャっとする */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding",
+		meta = (ClampMin = "0.0", ClampMax = "180.0"))
+	float SeatAngularSwingLimit = 35.0f;
+
+	/** 着座拘束の角度ツイスト上限 (deg)。ひねりの許容範囲 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding",
+		meta = (ClampMin = "0.0", ClampMax = "180.0"))
+	float SeatAngularTwistLimit = 25.0f;
+
+	/** 着座姿勢を直立へ戻す角度ドライブの剛性。大きいほど素早く起き上がる */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding",
+		meta = (ClampMin = "0.0"))
+	float SeatAngularDriveStiffness = 5000.0f;
+
+	/** 着座姿勢ドライブの減衰。揺れの収束を制御 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding",
+		meta = (ClampMin = "0.0"))
+	float SeatAngularDriveDamping = 500.0f;
+
+	/**
+	 * 着座拘束を物理破断させるか。
+	 * false（既定）= 物理破断しない（落馬は衝撃蓄積 ImpactThreshold 経由で判定＝安定）。
+	 * true = 下記しきい値超過で拘束自体が破断する（要調整。settle 中の力で誤破断しやすい）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding")
+	bool bSeatBreakable = false;
+
+	/** 着座拘束が破断する並進力のしきい値（bSeatBreakable=true のとき有効） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding",
+		meta = (ClampMin = "0.0", EditCondition = "bSeatBreakable"))
+	float SeatLinearBreakForce = 150000.0f;
+
+	/** 着座拘束が破断する回転トルクのしきい値（bSeatBreakable=true のとき有効） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Riding",
+		meta = (ClampMin = "0.0", EditCondition = "bSeatBreakable"))
+	float SeatAngularBreakTorque = 100000.0f;
+
+	// =====================================================================
+	// ヘッドバンキング攻撃
+	// =====================================================================
+
+	/** 横振りインパルスを与える上体ボーン名 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack")
+	FName HeadbangBoneName = FName("spine_03");
+
+	/** ヘッドバンキングの横方向インパルス強度 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HeadbangImpulse = 50000.0f;
+
+	/** ヘッドバンキング命中時に相手ジョッキーへ加える衝撃値（大） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HeadbangHitImpact = 3000.0f;
+
+	/** ヘッドバンキング時に自分のジョッキーへ蓄積する衝撃値（少量） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HeadbangSelfImpact = 300.0f;
+
+	/** 攻撃ヒットと判定する最小法線インパルス */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HeadbangHitMinNormalImpulse = 1.0f;
+
+	/** ヘッドバンキング後、命中を攻撃として扱う有効時間 (秒) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HeadbangActiveWindow = 0.25f;
+
+	/**
+	 * 近接ベースの攻撃ヒット判定半径 (cm)。物理衝突コールバックに依存せず、
+	 * 攻撃有効中にこの半径内の相手ジョッキー（pelvis 間距離）へ衝撃を与える。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HeadbangHitRadius = 120.0f;
+
+	/**
+	 * 射出ジョッキーが「着地した」とみなすメッシュ速度しきい値 (cm/s)。
+	 * 空中時間が MinAirborneBeforeLanding を超え、速度がこれ以下に落ちたら爆発する。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float LandingSpeedThreshold = 200.0f;
+
 private:
 	// 状態
 	bool bIsRiding = false;
@@ -308,17 +458,23 @@ private:
 	/** 現在の衝撃蓄積値 */
 	float ImpactAccumulation = 0.0f;
 
+	/** 衝撃計上の不応期タイマー(秒)。>0 の間は新規衝撃を無視する */
+	float ImpactRefractoryTimer = 0.0f;
+
+	/**
+	 * 落馬時に吹っ飛ぶ水平方向（直近に受けた衝撃の押し出し方向）。
+	 * ZeroVector のときは方向未指定とし、EnterRagdollState は後方へフォールバックする。
+	 */
+	FVector PendingKnockoffDir = FVector::ZeroVector;
+
 	/** 騎乗中の馬 */
 	UPROPERTY()
 	TObjectPtr<AHorseCharacter> OwningHorse;
 
-	/** 衝撃を加算し、閾値を超えれば落馬させる */
+	/** 衝撃を加算し、閾値を超えれば落馬／引きずりへ移行させる */
 	void AddImpact(float ImpactMagnitude);
 
-	/** 騎乗中の部分ラグドールを適用 */
-	void ApplyRidingPhysicsBlend();
-
-	/** 部分ラグドールを解除（ラグドール化／落馬時に呼ぶ） */
+	/** 全身ラグドールを解除（再騎乗・状態リセット時に呼ぶ） */
 	void ClearRidingPhysicsBlend();
 
 	/** ラグドール状態へ移行（落馬） */
@@ -347,6 +503,40 @@ private:
 
 	/** アンカー世界位置を解決 (ソケット優先、無効ならコンポーネント位置) */
 	FVector ResolveSwingAnchorWorld() const;
+
+	/**
+	 * 近接ベースの攻撃ヒット判定（Tick から呼ぶ）。
+	 * 攻撃有効中(HeadbangActiveTimer>0)に HeadbangHitRadius 内の相手ジョッキーへ衝撃を与える。
+	 * 物理 OnComponentHit に依存せず確定的に当てる。
+	 */
+	void UpdateHeadbangProximityHit();
+
+	/**
+	 * 射出ジョッキーの着地判定（Tick から呼ぶ）。
+	 * 空中時間が一定を超え、メッシュ速度が LandingSpeedThreshold 以下に落ちたら爆発する。
+	 */
+	void UpdateProjectileLanding();
+
+	// 鞍ラグドール騎乗用（PhysicsConstraint 着座拘束）
+	/** 着座拘束コンポーネント（実行時生成。馬カプセル↔ジョッキー pelvis を拘束） */
+	UPROPERTY()
+	TObjectPtr<UPhysicsConstraintComponent> SeatConstraint;
+
+	/** 着座拘束を生成・設定する（鞍位置に Linear Lock＋Angular Limited/Drive＋Break） */
+	void SetupSeatConstraint();
+
+	/** 着座拘束を破断・破棄する */
+	void BreakSeatConstraint();
+
+	/** 騎乗ラグドールから引きずり状態へ遷移する（拘束破断・被弾時） */
+	void TransitionToDragging();
+
+	/** 着座拘束が物理破断したときのコールバック */
+	UFUNCTION()
+	void HandleSeatConstraintBroken(int32 ConstraintIndex);
+
+	// ヘッドバンキング攻撃の有効残り時間 (秒)。>0 の間の接触を攻撃として扱う
+	float HeadbangActiveTimer = 0.0f;
 
 	/** デバッグUI描画 */
 	void DrawDebugUI();

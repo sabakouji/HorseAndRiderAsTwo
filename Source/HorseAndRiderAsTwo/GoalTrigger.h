@@ -25,6 +25,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Goal")
 	void SetRaceManager(ARaceManager* InManager) { RaceManager = InManager; }
 
+	/**
+	 * トリガーボックスをコース幅に合わせて構成する。
+	 * @param TrackHalfWidth 中心からの片側半幅(cm)。BoxExtent.Y に設定する。
+	 * 併せてボックスを半高ぶん上げ、底面を原点（路面）に合わせて埋没を防ぐ。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Goal")
+	void ConfigureForTrack(float TrackHalfWidth);
+
 protected:
 	virtual void BeginPlay() override;
 

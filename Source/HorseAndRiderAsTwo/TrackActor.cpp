@@ -28,6 +28,22 @@ void ATrackActor::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
 
+	// ループ設定と補間方式を反映。
+	// bLinearSpline=true は全点 Linear（直線/ポリライン）、false は全点 Curve（ベジエ曲線）。
+	if (Spline)
+	{
+		Spline->SetClosedLoop(bClosedLoop);
+
+		const ESplinePointType::Type PointType =
+			bLinearSpline ? ESplinePointType::Linear : ESplinePointType::Curve;
+		const int32 NumPoints = Spline->GetNumberOfSplinePoints();
+		for (int32 i = 0; i < NumPoints; ++i)
+		{
+			Spline->SetSplinePointType(i, PointType, false); // 各点更新は抑制し、最後に一括更新
+		}
+		Spline->UpdateSpline();
+	}
+
 	SyncPointWidthsToSpline();
 	ClearSplineMeshes();
 	BuildSplineMeshes();
@@ -250,6 +266,12 @@ TArray<FVector2D> ATrackActor::GetTrackShape2D(int32 NumSamples) const
 		Out.Add(FVector2D(FMath::Clamp(Nx, 0.0f, 1.0f), FMath::Clamp(Ny, 0.0f, 1.0f)));
 	}
 
+	// ClosedLoop は終点→始点の閉区間（橋）を描画側で必ず繋ぐため、始点を末尾へ複製して輪を閉じる。
+	if (bClosed && Out.Num() > 0)
+	{
+		Out.Add(Out[0]);
+	}
+
 	return Out;
 }
 
@@ -414,6 +436,13 @@ void ATrackActor::BuildAutoSpawnedTriggers()
 			LocateOnSpline(GoalDistance, Loc, Rot);
 			Comp->SetWorldLocationAndRotation(Loc, Rot);
 
+			// トリガーボックスをコース幅×倍率に連動させ、底面を路面に合わせる
+			if (AGoalTrigger* Goal = Cast<AGoalTrigger>(Comp->GetChildActor()))
+			{
+				Goal->ConfigureForTrack(
+					GetWidthAtDistance(FMath::Clamp(GoalDistance, 0.0f, SplineLen)) * TriggerWidthScale);
+			}
+
 			SpawnedGoalChild = Comp;
 		}
 	}
@@ -442,6 +471,8 @@ void ATrackActor::BuildAutoSpawnedTriggers()
 		if (ACheckpointActor* CP = Cast<ACheckpointActor>(Comp->GetChildActor()))
 		{
 			CP->CheckpointIndex = i;
+			// トリガーボックスをコース幅×倍率に連動させ、底面を路面に合わせる
+			CP->ConfigureForTrack(GetWidthAtDistance(FMath::Clamp(D, 0.0f, SplineLen)) * TriggerWidthScale);
 		}
 
 		SpawnedCheckpointChildren.Add(Comp);

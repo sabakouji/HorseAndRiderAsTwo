@@ -17,6 +17,7 @@
 #include "TrackActor.h"
 #include "RaceManager.h"
 #include "GhostRecorder.h"
+#include "AnimalStatsDataAsset.h"
 #include "Components/SplineComponent.h"
 #include "Kismet/GameplayStatics.h"
 
@@ -123,9 +124,8 @@ void AHorseCharacter::BeginPlay()
 		bInputLocked = false;
 	}
 
-	// UPROPERTY で設定された値を MovementComponent へ反映
-	GetCharacterMovement()->RotationRate  = FRotator(0.0f, TurnSpeed, 0.0f);
-	GetCharacterMovement()->MaxWalkSpeed  = MoveSpeed;
+	// AnimalStats（割当時）を各フィールドへ反映してから MovementComponent へ適用
+	ApplyAnimalStats();
 
 	// SpringArm の既定トランスフォームをキャッシュ（BP で編集された値を尊重）
 	if (SpringArm)
@@ -153,6 +153,9 @@ void AHorseCharacter::BeginPlay()
 	// Physics Asset が割り当て済みの場合のみ有効
 	if (USkeletalMeshComponent* MeshComp = GetMesh())
 	{
+		// ヘッドバンキング時の馬ロールのベースとなる既定相対回転をキャッシュ
+		DefaultMeshRelRot = MeshComp->GetRelativeRotation();
+
 		if (MeshComp->GetPhysicsAsset())
 		{
 			// SimulateBelowBoneName で指定したボーン以下を物理演算に切り替える
@@ -185,14 +188,11 @@ void AHorseCharacter::BeginPlay()
 	InitializeRopeReinsFromChildActor();
 	InitializeJockeyFromChildActor();
 
-	// プレイヤー馬にのみゴースト記録コンポーネントを動的付与する。
-	if (!bIsAI && !GhostRecorder)
+	// レベルに直接配置された AI 馬（スポーナを介さない場合）はここで個体差を確定する。
+	// スポーナ経由の馬は SpawnGrid 内で bIsAI=true 設定後に InitializeAIProfile が呼ばれる。
+	if (bIsAI)
 	{
-		GhostRecorder = NewObject<UGhostRecorder>(this);
-		if (GhostRecorder)
-		{
-			GhostRecorder->RegisterComponent();
-		}
+		InitializeAIProfile();
 	}
 }
 
@@ -401,29 +401,25 @@ void AHorseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComp
 
 		if (BrakeAction)
 		{
-			// ブレーキ: 押した瞬間に 1 回だけ射出判定
+			// ブレーキ: 押した瞬間に射出判定＋ブレーキ開始、離すまで減速を継続
 			EnhancedInput->BindAction(BrakeAction, ETriggerEvent::Started,
 				this, &AHorseCharacter::BrakePressed);
+			EnhancedInput->BindAction(BrakeAction, ETriggerEvent::Completed,
+				this, &AHorseCharacter::BrakeReleased);
 		}
 
-		if (DebugSwingAction)
+		if (TiltAction)
 		{
-			// 振り回し toggle: 押した瞬間に 1 回だけ切替
-			EnhancedInput->BindAction(DebugSwingAction, ETriggerEvent::Started,
-				this, &AHorseCharacter::ToggleDebugSwing);
+			// 傾け: 押している間 Axis1D 値で馬メッシュをロールさせる
+			EnhancedInput->BindAction(TiltAction, ETriggerEvent::Triggered,
+				this, &AHorseCharacter::TiltTriggered);
+			EnhancedInput->BindAction(TiltAction, ETriggerEvent::Completed,
+				this, &AHorseCharacter::TiltReleased);
 		}
 	}
 
-	// デバッグ用: Enter キーでレースのカウントダウンを開始する。
-	// EnhancedInput の InputAction アセットを別途作成せずに済むよう、
-	// レガシーの BindKey を使用する（EnhancedInputComponent でも併用可能）。
-	if (PlayerInputComponent)
-	{
-		PlayerInputComponent->BindKey(EKeys::Enter, IE_Pressed,
-			this, &AHorseCharacter::DebugStartRace);
-		PlayerInputComponent->BindKey(EKeys::Gamepad_Special_Right, IE_Pressed,
-			this, &AHorseCharacter::DebugStartRace);
-	}
+	// レース開始は RaceManager の演出カメラ完了後に自動でカウントダウンへ移行する
+	// （旧 Enter キー手動開始は廃止）。
 }
 
 // =====================================================================
@@ -453,6 +449,12 @@ void AHorseCharacter::Tick(float DeltaTime)
 	// --- コースルールの監視 ---
 	CheckCourseRules(DeltaTime);
 
+	// --- スタミナの更新（ダッシュ消費・回復・枯渇でダッシュ終了） ---
+	UpdateStamina(DeltaTime);
+
+	// --- 傾け（攻撃）入力を馬メッシュのロールへ反映 ---
+	UpdateTilt(DeltaTime);
+
 	// --- 入力ロックのシャドウ ---
 	// bInputLocked == true の間はプレイヤー入力・AI 入力いずれの場合も 0 化する。
 	// CurrentForwardInput/RightInput そのものは書き換えないため、AI 側の状態は破壊しない。
@@ -467,9 +469,29 @@ void AHorseCharacter::Tick(float DeltaTime)
 		AddActorWorldRotation(FRotator(0.0f, DeltaYaw, 0.0f));
 	}
 
+	// --- ブレーキ減速 ---
+	// ブレーキ中は前進入力を抑制し、BrakingDeceleration で水平速度を直接減衰させる。
+	// 入力ロック中は減速しない（Pregame/Countdown/Finished）。
+	if (bBraking && !bInputLocked)
+	{
+		if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+		{
+			FVector Vel = CMC->Velocity;
+			FVector HorizVel(Vel.X, Vel.Y, 0.0f);
+			const float HorizSpeed = HorizVel.Size();
+			if (HorizSpeed > KINDA_SMALL_NUMBER)
+			{
+				const float NewSpeed = FMath::Max(0.0f, HorizSpeed - BrakingDeceleration * DeltaTime);
+				const FVector NewHoriz = HorizVel.GetSafeNormal() * NewSpeed;
+				CMC->Velocity = FVector(NewHoriz.X, NewHoriz.Y, Vel.Z);
+			}
+		}
+	}
+
 	// --- 前進・後退（W/S） ---
 	// 馬自身の前方ベクトルを使うことで S キーでも振り返らない
-	if (!FMath::IsNearlyZero(EffectiveForward))
+	// ブレーキ中は前進ドライブを止め、純粋に減速させる
+	if (!bBraking && !FMath::IsNearlyZero(EffectiveForward))
 	{
 		AddMovementInput(GetActorForwardVector(), EffectiveForward);
 	}
@@ -528,9 +550,11 @@ void AHorseCharacter::UpdateDashCameraBlend(float DeltaTime)
 void AHorseCharacter::TryPickupJockey()
 {
 	if (!CurrentJockey) { return; }
-	if (!CurrentJockey->IsKnockedOut()) { return; }
+	// 落馬（KnockedOut）または引きずり（Swinging）中のジョッキーを対象にする
+	if (!CurrentJockey->IsKnockedOut() && !CurrentJockey->IsSwinging()) { return; }
 
-	const float Dist = FVector::Dist(GetActorLocation(), CurrentJockey->GetActorLocation());
+	// 距離はジョッキー実体（pelvis）位置で判定（ラグドールはアクタールートに追従しないため）
+	const float Dist = FVector::Dist(GetActorLocation(), CurrentJockey->GetBodyWorldLocation());
 	if (Dist <= PickupRadius)
 	{
 		CurrentJockey->WakeUpAndRide(this);
@@ -556,9 +580,9 @@ void AHorseCharacter::DebugForceJockeyRagdoll()
 void AHorseCharacter::DrawPickupHint()
 {
 	if (!GEngine) { return; }
-	if (!CurrentJockey || !CurrentJockey->IsKnockedOut()) { return; }
+	if (!CurrentJockey || (!CurrentJockey->IsKnockedOut() && !CurrentJockey->IsSwinging())) { return; }
 
-	const float Dist = FVector::Dist(GetActorLocation(), CurrentJockey->GetActorLocation());
+	const float Dist = FVector::Dist(GetActorLocation(), CurrentJockey->GetBodyWorldLocation());
 	if (Dist > PickupRadius) { return; }
 
 	GEngine->AddOnScreenDebugMessage(
@@ -596,15 +620,55 @@ void AHorseCharacter::MoveCompleted(const FInputActionValue& Value)
 }
 
 // =====================================================================
+// 動物パラメータ適用（DataAsset → 各フィールド / CharacterMovement）
+// =====================================================================
+void AHorseCharacter::ApplyAnimalStats()
+{
+	// DataAsset が割り当てられていれば各フィールドへ反映（未割当時は既定値を維持）
+	if (AnimalStats)
+	{
+		MoveSpeed                  = AnimalStats->MaxMoveSpeed;
+		MaxAcceleration            = AnimalStats->MaxAcceleration;
+		TurnSpeed                  = AnimalStats->TurnSpeed;
+		DashSpeedMultiplier        = AnimalStats->DashSpeedMultiplier;
+		DashAccelerationMultiplier = AnimalStats->DashAccelerationMultiplier;
+		BrakingDeceleration        = AnimalStats->BrakingDeceleration;
+		EjectForwardSpeed          = AnimalStats->EjectForwardSpeed;
+		EjectUpSpeed               = AnimalStats->EjectUpSpeed;
+		StaminaMax                 = AnimalStats->StaminaMax;
+		StaminaDrainPerSec         = AnimalStats->StaminaDrainPerSec;
+		StaminaRegenPerSec         = AnimalStats->StaminaRegenPerSec;
+		StaminaRegenDelay          = AnimalStats->StaminaRegenDelay;
+	}
+
+	// スタミナを満タンに初期化
+	CurrentStamina = StaminaMax;
+
+	// CharacterMovement へ反映（ダッシュ中は倍率を維持）
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->RotationRate               = FRotator(0.0f, TurnSpeed, 0.0f);
+		CMC->MaxWalkSpeed               = bIsDashing ? MoveSpeed * DashSpeedMultiplier : MoveSpeed;
+		CMC->MaxAcceleration            = bIsDashing ? MaxAcceleration * DashAccelerationMultiplier : MaxAcceleration;
+		CMC->BrakingDecelerationWalking = BrakingDeceleration;
+	}
+}
+
+// =====================================================================
 // ダッシュ
 // =====================================================================
 void AHorseCharacter::DashStarted()
 {
 	if (bIsDashing) { return; }
+
+	// スタミナが残っていなければダッシュ不可
+	if (CurrentStamina <= 0.0f) { return; }
+
 	bIsDashing = true;
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
-		CMC->MaxWalkSpeed = MoveSpeed * DashSpeedMultiplier;
+		CMC->MaxWalkSpeed    = MoveSpeed * DashSpeedMultiplier;
+		CMC->MaxAcceleration = MaxAcceleration * DashAccelerationMultiplier;
 	}
 }
 
@@ -613,24 +677,59 @@ void AHorseCharacter::DashCompleted()
 	bIsDashing = false;
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
-		CMC->MaxWalkSpeed = MoveSpeed;
+		CMC->MaxWalkSpeed    = MoveSpeed;
+		CMC->MaxAcceleration = MaxAcceleration;
 	}
 }
 
 // =====================================================================
-// ブレーキ → 射出判定
+// スタミナ更新（ダッシュ消費 / 非ダッシュ回復 / 枯渇でダッシュ強制終了）
+// =====================================================================
+void AHorseCharacter::UpdateStamina(float DeltaTime)
+{
+	if (bIsDashing)
+	{
+		// ダッシュ中は消費し、回復猶予をリセット
+		CurrentStamina = FMath::Max(0.0f, CurrentStamina - StaminaDrainPerSec * DeltaTime);
+		StaminaRegenElapsed = 0.0f;
+
+		// 枯渇したらダッシュを強制終了
+		if (CurrentStamina <= 0.0f)
+		{
+			DashCompleted();
+		}
+	}
+	else
+	{
+		// 非ダッシュ時は猶予経過後に回復
+		StaminaRegenElapsed += DeltaTime;
+		if (StaminaRegenElapsed >= StaminaRegenDelay)
+		{
+			CurrentStamina = FMath::Min(StaminaMax, CurrentStamina + StaminaRegenPerSec * DeltaTime);
+		}
+	}
+
+	// デバッグ表示
+	if (bShowStaminaDebug && GEngine)
+	{
+		const float Ratio = (StaminaMax > 0.0f) ? (CurrentStamina / StaminaMax) : 0.0f;
+		const FColor BarColor = (Ratio > 0.5f) ? FColor::Green : (Ratio > 0.2f ? FColor::Yellow : FColor::Red);
+		GEngine->AddOnScreenDebugMessage(
+			static_cast<uint64>(GetUniqueID()), 0.0f, BarColor,
+			FString::Printf(TEXT("Stamina: %.0f / %.0f"), CurrentStamina, StaminaMax));
+	}
+}
+
+// =====================================================================
+// ブレーキ → 射出判定（押下時）/ ブレーキ減速の開始・終了
 // =====================================================================
 void AHorseCharacter::BrakePressed()
 {
 	const float Speed = GetVelocity().Size();
 	const bool bFastEnough = (Speed >= MinSpeedToEject);
 
-	// 急ブレーキ: 入力をリセット
-	CurrentForwardInput = 0.0f;
-	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
-	{
-		CMC->StopMovementImmediately();
-	}
+	// ブレーキ減速を開始（離すまで Tick で BrakingDeceleration による減速を適用）
+	bBraking = true;
 
 	// ダッシュ中かつ十分な速度 → ジョッキー射出
 	if (bIsDashing && bFastEnough && CurrentJockey && CurrentJockey->IsRiding())
@@ -639,80 +738,109 @@ void AHorseCharacter::BrakePressed()
 	}
 }
 
+void AHorseCharacter::BrakeReleased()
+{
+	bBraking = false;
+}
+
 // =====================================================================
 // ジョッキー射出
 // =====================================================================
 void AHorseCharacter::EjectJockey()
 {
+	// 既定は馬の現在前方へ射出（プレイヤー入力・既存呼び出しの互換）
+	EjectJockey(GetActorForwardVector());
+}
+
+void AHorseCharacter::EjectJockey(const FVector& WorldAimDir)
+{
 	if (!CurrentJockey) { return; }
 
-	// 馬の現在前方＋上方向で放物線速度を構築
-	const FVector Forward = GetActorForwardVector();
-	const FVector Up = FVector::UpVector;
-	const FVector Velocity = Forward * EjectForwardSpeed + Up * EjectUpSpeed;
+	// 指定方向の水平成分を狙いに使う。無効ならアクター前方へフォールバック
+	FVector AimDir = WorldAimDir;
+	AimDir.Z = 0.0f;
+	if (!AimDir.Normalize())
+	{
+		AimDir = GetActorForwardVector();
+		AimDir.Z = 0.0f;
+		if (!AimDir.Normalize()) { return; }
+	}
+
+	// 狙い方向＋上方向で放物線速度を構築
+	const FVector Velocity = AimDir * EjectForwardSpeed + FVector::UpVector * EjectUpSpeed;
 
 	CurrentJockey->LaunchAsProjectile(Velocity);
 }
 
 // =====================================================================
-// デバッグ: 振り回しモード toggle
+// 傾け入力（攻撃）: Axis1D 値を保持
 // =====================================================================
-void AHorseCharacter::ToggleDebugSwing()
+void AHorseCharacter::TiltTriggered(const FInputActionValue& Value)
 {
-	if (!CurrentJockey) { return; }
+	// マウス移動量はそのまま受け取る（移動量に比例して傾けるためクランプしない）
+	TiltInput = Value.Get<float>();
+}
 
-	if (CurrentJockey->IsSwinging())
-	{
-		CurrentJockey->ExitSwingMode();
-	}
-	else
-	{
-		USkeletalMeshComponent* HorseMesh = GetMesh();
-		if (HorseMesh)
-		{
-			CurrentJockey->EnterSwingMode(HorseMesh, SwingAnchorSocketName);
-		}
-	}
+void AHorseCharacter::TiltReleased()
+{
+	TiltInput = 0.0f;
 }
 
 // =====================================================================
-// デバッグ: Enter キーでレースのカウントダウンを開始する
+// 傾け入力の角速度を監視し、素早い傾けでヘッドバンキング攻撃を発動する
 // =====================================================================
-void AHorseCharacter::DebugStartRace()
+void AHorseCharacter::UpdateTilt(float DeltaTime)
 {
-	// キャッシュが無ければレベルから RaceManager を検索する
-	if (!CachedRaceManager)
+	// 入力ロック中はマウス移動を無視
+	const float Input = bInputLocked ? 0.0f : TiltInput;
+	TiltInput = 0.0f; // この1フレーム分のマウス移動量を消費
+
+	// マウス移動量に比例して傾きを更新（移動量が大きいほど大きく傾く）。最大角でクランプ。
+	// 符号を反転し、マウス右で右へ傾くようにする。
+	CurrentHorseRoll = FMath::Clamp(
+		CurrentHorseRoll - Input * HorseTiltSensitivity,
+		-HeadbangHorseRollAngle, HeadbangHorseRollAngle);
+
+	// 入力が無いフレームは中心(0)へ徐々に戻す（スプリングバック）
+	if (FMath::IsNearlyZero(Input))
 	{
-		TArray<AActor*> FoundManagers;
-		UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARaceManager::StaticClass(), FoundManagers);
-		if (FoundManagers.Num() > 0)
-		{
-			CachedRaceManager = Cast<ARaceManager>(FoundManagers[0]);
-		}
+		CurrentHorseRoll = FMath::FInterpTo(CurrentHorseRoll, 0.0f, DeltaTime, HorseTiltReturnSpeed);
 	}
 
-	if (CachedRaceManager)
+	// 馬メッシュを「既定相対回転 ＋ アクター前方軸まわりのロール」で傾ける。
+	// 鞍ボーンも一緒に傾くため、着座拘束されたジョッキーが横へ振り出される。
+	if (USkeletalMeshComponent* HorseMesh = GetMesh())
 	{
-		CachedRaceManager->StartCountdown();
-
-		if (GEngine)
-		{
-			GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan,
-				TEXT("[Debug] StartCountdown() requested"));
-		}
+		const FQuat BaseQ = DefaultMeshRelRot.Quaternion();
+		const FQuat RollQ = FQuat(FVector::ForwardVector, FMath::DegreesToRadians(CurrentHorseRoll));
+		HorseMesh->SetRelativeRotation(RollQ * BaseQ);
 	}
-	else if (GEngine)
+
+	// 傾きが攻撃しきい値以上の間、ジョッキーの接触を攻撃として扱う
+	if (CurrentJockey)
 	{
-		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Red,
-			TEXT("[Debug] RaceManager not found"));
+		CurrentJockey->SetHeadbangActive(FMath::Abs(CurrentHorseRoll) >= HorseAttackRollThreshold);
 	}
 }
+
 
 // =====================================================================
 // AI自動走行の入力更新
 // =====================================================================
 void AHorseCharacter::UpdateAIControl(float DeltaTime)
 {
+	// 射出クールダウンの経過
+	if (AIEjectCooldownTimer > 0.0f)
+	{
+		AIEjectCooldownTimer = FMath::Max(0.0f, AIEjectCooldownTimer - DeltaTime);
+	}
+
+	// 自ジョッキーが落馬中なら最優先で回収に向かう（通常レース挙動より優先）
+	if (UpdateAIRecoverJockey(DeltaTime))
+	{
+		return;
+	}
+
 	if (!TrackActorRef)
 	{
 		// 見つからない場合は再検索を試みる
@@ -742,13 +870,62 @@ void AHorseCharacter::UpdateAIControl(float DeltaTime)
 	// 入力キーから現在のスプライン上の距離を取得
 	const float ClosestDistance = Spline->GetDistanceAlongSplineAtSplineInputKey(ClosestKey);
 
-	// 少し先の目標距離を計算
+	// 少し先の目標距離を計算（個体ごとの Lookahead ジッタを加算）
 	const float SplineLength = Spline->GetSplineLength();
 	const bool bClosed = Spline->IsClosedLoop();
-	const float TargetDistance = NormalizeSplineDistance(ClosestDistance + LookaheadDistance, SplineLength, bClosed);
+	const float EffLookahead = FMath::Max(50.0f, LookaheadDistance + AILookaheadOffset);
+	const float TargetDistance = NormalizeSplineDistance(ClosestDistance + EffLookahead, SplineLength, bClosed);
 
-	// 目標距離におけるスプライン上の目標位置を取得
-	const FVector TargetLoc = Spline->GetLocationAtDistanceAlongSpline(TargetDistance, ESplineCoordinateSpace::World);
+	// -------------------------------------------------------------
+	// 曲率推定（速度制御・ライン取り・ダッシュ判定で共有）
+	// Lookahead 目標距離の前後 ±CurvatureSampleStep の Tangent 差から
+	// 曲率係数 CurvatureAlpha(0=直線〜1=最大屈曲) と曲がる向き InsideSign を求める。
+	// -------------------------------------------------------------
+	constexpr float MaxBendDegForFullSlow = 45.0f;
+	float CurvatureAlpha = 0.0f;
+	float InsideSign = 0.0f; // +1=右が内側 / -1=左が内側
+
+	const float BackDistance = NormalizeSplineDistance(TargetDistance - CurvatureSampleStep, SplineLength, bClosed);
+	const float FwdDistance  = NormalizeSplineDistance(TargetDistance + CurvatureSampleStep, SplineLength, bClosed);
+	FVector TangentBack = Spline->GetTangentAtDistanceAlongSpline(BackDistance, ESplineCoordinateSpace::World);
+	FVector TangentFwd  = Spline->GetTangentAtDistanceAlongSpline(FwdDistance,  ESplineCoordinateSpace::World);
+	TangentBack.Z = 0.0f;
+	TangentFwd.Z  = 0.0f;
+	if (TangentBack.Normalize() && TangentFwd.Normalize())
+	{
+		const float CosBend = FVector::DotProduct(TangentBack, TangentFwd);
+		const float BendDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(CosBend, -1.0f, 1.0f)));
+		CurvatureAlpha = FMath::Clamp(BendDeg / MaxBendDegForFullSlow, 0.0f, 1.0f);
+
+		// Tangent の回転方向（Z>0 で左旋回）。内側は旋回方向と同じ側。
+		const float TurnZ = FVector::CrossProduct(TangentBack, TangentFwd).Z;
+		InsideSign = (TurnZ > 0.0f) ? -1.0f : 1.0f; // 左旋回→内側は左(-) / 右旋回→内側は右(+)
+	}
+
+	// -------------------------------------------------------------
+	// 位置取り（ライン取り）: 目標点をコース幅内で横方向にオフセットする。
+	// 個体レーン嗜好＋コーナー内側バイアスを合成し、コース端余白でクランプ。
+	// -------------------------------------------------------------
+	FVector TargetLoc = Spline->GetLocationAtDistanceAlongSpline(TargetDistance, ESplineCoordinateSpace::World);
+
+	float LaneRatio = AILanePreference * AILaneSpreadMax + InsideSign * CurvatureAlpha * AICornerCut;
+	LaneRatio = FMath::Clamp(LaneRatio, -1.0f, 1.0f);
+
+	const float HalfWidth = TrackActorRef->GetWidthAtDistance(TargetDistance);
+	const float UsableHalf = FMath::Max(0.0f, HalfWidth - AILaneEdgeMargin);
+	if (UsableHalf > KINDA_SMALL_NUMBER)
+	{
+		FVector TargetTangent = Spline->GetTangentAtDistanceAlongSpline(TargetDistance, ESplineCoordinateSpace::World);
+		TargetTangent.Z = 0.0f;
+		if (TargetTangent.Normalize())
+		{
+			FVector RightAtTarget = FVector::CrossProduct(FVector::UpVector, TargetTangent);
+			if (RightAtTarget.Normalize())
+			{
+				TargetLoc += RightAtTarget * (LaneRatio * UsableHalf);
+			}
+		}
+	}
 
 	// 目標位置への方向ベクトル（水平面のみ）を計算
 	FVector ToTarget = TargetLoc - CurrentLoc;
@@ -778,100 +955,378 @@ void AHorseCharacter::UpdateAIControl(float DeltaTime)
 		// ここでは偏差30度以上で最大入力（1.0 / -1.0）になるように設定
 		CurrentRightInput = FMath::Clamp(AngleDiffDeg / 30.0f, -1.0f, 1.0f);
 
-		// -------------------------------------------------------------
-		// 曲率推定による前進入力スケール（AI 速度制御）
-		// Lookahead 目標距離の前後 ±CurvatureSampleStep における
-		// スプライン Tangent の向きの差分から曲率を推定し、
-		// 曲率が大きいほど前進入力を MinAISpeedRatio まで段階的に絞る。
-		// -------------------------------------------------------------
-		// この角度差(度)以上の屈曲で最大減速とする閾値（マジックナンバー回避のため名前付き定数化）
-		constexpr float MaxBendDegForFullSlow = 45.0f;
-
-		float SpeedRatio = 1.0f;
-
-		const float BackDistance = NormalizeSplineDistance(TargetDistance - CurvatureSampleStep, SplineLength, bClosed);
-		const float FwdDistance  = NormalizeSplineDistance(TargetDistance + CurvatureSampleStep, SplineLength, bClosed);
-
-		FVector TangentBack = Spline->GetTangentAtDistanceAlongSpline(BackDistance, ESplineCoordinateSpace::World);
-		FVector TangentFwd  = Spline->GetTangentAtDistanceAlongSpline(FwdDistance,  ESplineCoordinateSpace::World);
-		TangentBack.Z = 0.0f;
-		TangentFwd.Z  = 0.0f;
-
-		// Tangent が正常に正規化できた場合のみ曲率減速を適用（ゼロ長時は減速なしでフォールバック）
-		if (TangentBack.Normalize() && TangentFwd.Normalize())
-		{
-			const float CosBend = FVector::DotProduct(TangentBack, TangentFwd);
-			const float BendDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(CosBend, -1.0f, 1.0f)));
-
-			// 曲率係数（0=直線 〜 1=最大屈曲）
-			const float CurvatureAlpha = FMath::Clamp(BendDeg / MaxBendDegForFullSlow, 0.0f, 1.0f);
-
-			// 曲率が大きいほど前進入力を 1.0 → MinAISpeedRatio へ線形に低下
-			SpeedRatio = FMath::Lerp(1.0f, MinAISpeedRatio, CurvatureAlpha);
-		}
-
-		// 前進入力は曲率に応じてスケールした値
-		CurrentForwardInput = SpeedRatio;
+		// 曲率が大きいほど前進入力を 1.0 → MinAISpeedRatio へ線形に低下
+		CurrentForwardInput = FMath::Lerp(1.0f, MinAISpeedRatio, CurvatureAlpha);
 
 		// -------------------------------------------------------------
-		// 他馬回避（近傍検索＋旋回オフセット）
-		// 自馬中心から AvoidanceRadius 内の最近接他馬を検索し、
-		// 相手と反対方向へ CurrentRightInput に回避オフセットを加算する。
+		// 他馬の一括取得（回避・攻撃・ダッシュ前方判定で共有）
 		// -------------------------------------------------------------
-		TArray<AActor*> OtherHorses;
-		UGameplayStatics::GetAllActorsOfClass(GetWorld(), AHorseCharacter::StaticClass(), OtherHorses);
-
-		AHorseCharacter* NearestOther = nullptr;
-		float NearestDist = AvoidanceRadius;
-
-		for (AActor* Actor : OtherHorses)
+		TArray<AActor*> FoundHorses;
+		UGameplayStatics::GetAllActorsOfClass(GetWorld(), AHorseCharacter::StaticClass(), FoundHorses);
+		TArray<AHorseCharacter*> OtherHorses;
+		OtherHorses.Reserve(FoundHorses.Num());
+		for (AActor* Actor : FoundHorses)
 		{
 			AHorseCharacter* OtherHorse = Cast<AHorseCharacter>(Actor);
-			if (!OtherHorse || OtherHorse == this) { continue; }
-
-			const float Dist = FVector::Dist2D(CurrentLoc, OtherHorse->GetActorLocation());
-			if (Dist < NearestDist)
+			if (OtherHorse && OtherHorse != this)
 			{
-				NearestDist = Dist;
-				NearestOther = OtherHorse;
+				OtherHorses.Add(OtherHorse);
 			}
 		}
 
-		if (NearestOther)
+		// -------------------------------------------------------------
+		// 攻撃AI: 近接した相手ジョッキーへヘッドバングを狙う。
+		// 交戦中は寄せる操舵バイアスを加え、通常の回避を抑制する。
+		// -------------------------------------------------------------
+		float AttackSteerBias = 0.0f;
+		const bool bAttacking = UpdateAIAttack(OtherHorses, AttackSteerBias);
+
+		if (bAttacking)
 		{
-			// 自馬から相手への水平方向ベクトル
-			FVector ToOther = NearestOther->GetActorLocation() - CurrentLoc;
-			ToOther.Z = 0.0f;
-
-			// 自馬の右ベクトル（水平）
-			FVector RightVec = GetActorRightVector();
-			RightVec.Z = 0.0f;
-
-			if (ToOther.Normalize() && RightVec.Normalize())
+			// 攻撃対象へわずかに寄せて接触を作る（回避はしない）
+			CurrentRightInput = FMath::Clamp(CurrentRightInput + AttackSteerBias, -1.0f, 1.0f);
+		}
+		else
+		{
+			// -------------------------------------------------------------
+			// 他馬回避（近傍検索＋旋回オフセット）
+			// -------------------------------------------------------------
+			AHorseCharacter* NearestOther = nullptr;
+			float NearestDist = AvoidanceRadius;
+			for (AHorseCharacter* OtherHorse : OtherHorses)
 			{
-				// 相手が右側(+)か左側(-)か。反対方向へ避けるため符号を反転して使用
-				const float SideDot = FVector::DotProduct(ToOther, RightVec);
+				const float Dist = FVector::Dist2D(CurrentLoc, OtherHorse->GetActorLocation());
+				if (Dist < NearestDist)
+				{
+					NearestDist = Dist;
+					NearestOther = OtherHorse;
+				}
+			}
 
-				// 近いほど強く避ける（0〜1）
-				const float Proximity = 1.0f - FMath::Clamp(NearestDist / AvoidanceRadius, 0.0f, 1.0f);
-
-				// 正面接近（SideDot≈0）で回避方向が不定になり膠着するのを防ぐため、
-				// その場合は固定で右方向へ微小バイアスを与える
-				constexpr float HeadOnThreshold = 0.05f;
-				float SideSign = (FMath::Abs(SideDot) < HeadOnThreshold)
-					? 1.0f                       // 正面 → 右へ避ける固定バイアス
-					: -FMath::Sign(SideDot);     // 相手と反対方向
-
-				const float AvoidOffset = SideSign * Proximity * AvoidanceWeight;
-				CurrentRightInput = FMath::Clamp(CurrentRightInput + AvoidOffset, -1.0f, 1.0f);
+			if (NearestOther)
+			{
+				FVector ToOther = NearestOther->GetActorLocation() - CurrentLoc;
+				ToOther.Z = 0.0f;
+				FVector RightVec = GetActorRightVector();
+				RightVec.Z = 0.0f;
+				if (ToOther.Normalize() && RightVec.Normalize())
+				{
+					const float SideDot = FVector::DotProduct(ToOther, RightVec);
+					const float Proximity = 1.0f - FMath::Clamp(NearestDist / AvoidanceRadius, 0.0f, 1.0f);
+					constexpr float HeadOnThreshold = 0.05f;
+					float SideSign = (FMath::Abs(SideDot) < HeadOnThreshold)
+						? 1.0f
+						: -FMath::Sign(SideDot);
+					const float AvoidOffset = SideSign * Proximity * AvoidanceWeight;
+					CurrentRightInput = FMath::Clamp(CurrentRightInput + AvoidOffset, -1.0f, 1.0f);
+				}
 			}
 		}
+
+		// -------------------------------------------------------------
+		// ダッシュAI: 直線・前方クリア・スタミナ・積極性で加速判断
+		// -------------------------------------------------------------
+		UpdateAIDash(CurvatureAlpha, OtherHorses);
+
+		// -------------------------------------------------------------
+		// 射出AI: 前方の騎乗中の相手へジョッキーを射出する（攻撃的な個体のみ）
+		// -------------------------------------------------------------
+		UpdateAIEject(OtherHorses);
 	}
 	else
 	{
 		CurrentForwardInput = 0.0f;
 		CurrentRightInput = 0.0f;
 	}
+}
+
+// =====================================================================
+// AI個体差プロファイルの確定（個体値範囲内で乱数決定）
+// =====================================================================
+void AHorseCharacter::InitializeAIProfile()
+{
+	if (bAIProfileInitialized) { return; }
+	bAIProfileInitialized = true;
+
+	// レーン嗜好は左端〜右端の連続値。個体ごとの走行ラインの違いを生む。
+	AILanePreference = FMath::FRandRange(-1.0f, 1.0f);
+
+	// コーナーのイン取り量（0〜AICornerCutMax）。
+	AICornerCut = FMath::FRandRange(0.0f, FMath::Max(0.0f, AICornerCutMax));
+
+	// 積極性（ダッシュ・攻撃の発火しやすさ）。
+	const float AggLo = FMath::Min(AIAggressionMin, AIAggressionMax);
+	const float AggHi = FMath::Max(AIAggressionMin, AIAggressionMax);
+	AIAggression = FMath::FRandRange(AggLo, AggHi);
+
+	// Lookahead の個体ジッタ（±AILookaheadJitter）。
+	AILookaheadOffset = FMath::FRandRange(-AILookaheadJitter, AILookaheadJitter);
+
+	// 速度スケールを MoveSpeed に反映して top speed を個体化する。
+	const float ScaleLo = FMath::Min(AISpeedScaleMin, AISpeedScaleMax);
+	const float ScaleHi = FMath::Max(AISpeedScaleMin, AISpeedScaleMax);
+	const float SpeedScale = FMath::FRandRange(ScaleLo, ScaleHi);
+	MoveSpeed *= SpeedScale;
+
+	// CharacterMovement の最大速度へ即時反映（ダッシュ中なら倍率を維持）。
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->MaxWalkSpeed = bIsDashing ? MoveSpeed * DashSpeedMultiplier : MoveSpeed;
+	}
+}
+
+// =====================================================================
+// AIダッシュ判断
+// =====================================================================
+void AHorseCharacter::UpdateAIDash(float CurvatureAlpha, const TArray<AHorseCharacter*>& OtherHorses)
+{
+	// リザルト演出中・入力ロック中・消極的な個体はダッシュしない
+	if (bExhibitionMode || bInputLocked || AIAggression < AIDashAggressionThreshold)
+	{
+		if (bIsDashing) { DashCompleted(); }
+		return;
+	}
+
+	// 直線条件
+	const bool bStraight = (CurvatureAlpha < AIDashCurvatureMax);
+
+	// スタミナ条件
+	const float StaminaRatio = (StaminaMax > 0.0f) ? (CurrentStamina / StaminaMax) : 0.0f;
+	const bool bStaminaOK = (StaminaRatio > AIDashMinStaminaRatio);
+
+	// 前方クリア条件: 前方コーン内の他馬が AIDashForwardClearDist 以内に居れば不可
+	bool bForwardClear = true;
+	const FVector CurrentLoc = GetActorLocation();
+	FVector Forward = GetActorForwardVector();
+	Forward.Z = 0.0f;
+	if (Forward.Normalize())
+	{
+		for (AHorseCharacter* OtherHorse : OtherHorses)
+		{
+			FVector ToOther = OtherHorse->GetActorLocation() - CurrentLoc;
+			ToOther.Z = 0.0f;
+			const float Dist = ToOther.Size();
+			if (Dist > AIDashForwardClearDist) { continue; }
+			if (Dist <= KINDA_SMALL_NUMBER) { bForwardClear = false; break; }
+			// 前方コーン内（dot>0.5 ≒ ±60度）に居れば塞がれている
+			if (FVector::DotProduct(Forward, ToOther / Dist) > 0.5f)
+			{
+				bForwardClear = false;
+				break;
+			}
+		}
+	}
+
+	const bool bShouldDash = bStraight && bStaminaOK && bForwardClear;
+	if (bShouldDash && !bIsDashing)
+	{
+		DashStarted();
+	}
+	else if (!bShouldDash && bIsDashing)
+	{
+		DashCompleted();
+	}
+}
+
+// =====================================================================
+// AI攻撃判断（ヘッドバングで相手ジョッキーの落馬を狙う）
+// =====================================================================
+bool AHorseCharacter::UpdateAIAttack(const TArray<AHorseCharacter*>& OtherHorses, float& OutSteerBias)
+{
+	OutSteerBias = 0.0f;
+
+	// リザルト演出中・入力ロック中・消極的な個体・自分が騎乗していない場合は攻撃しない
+	if (bExhibitionMode || bInputLocked || AIAggression < AIAttackAggressionThreshold)
+	{
+		return false;
+	}
+	if (!CurrentJockey || !CurrentJockey->IsRiding() || CurrentJockey->IsKnockedOut())
+	{
+		return false;
+	}
+
+	const FVector CurrentLoc = GetActorLocation();
+	FVector Forward = GetActorForwardVector();
+	Forward.Z = 0.0f;
+	FVector RightVec = GetActorRightVector();
+	RightVec.Z = 0.0f;
+	if (!Forward.Normalize() || !RightVec.Normalize())
+	{
+		return false;
+	}
+
+	// 攻撃可能な最近接の相手（騎乗中・未落馬のジョッキーを持つ馬）を探す
+	AHorseCharacter* Target = nullptr;
+	float NearestDist = AIAttackRadius;
+	float TargetSideDot = 0.0f;
+	for (AHorseCharacter* OtherHorse : OtherHorses)
+	{
+		AJockey* OtherJockey = OtherHorse->GetCurrentJockey();
+		if (!OtherJockey || !OtherJockey->IsRiding() || OtherJockey->IsKnockedOut())
+		{
+			continue;
+		}
+
+		FVector ToOther = OtherHorse->GetActorLocation() - CurrentLoc;
+		ToOther.Z = 0.0f;
+		const float Dist = ToOther.Size();
+		if (Dist >= NearestDist || Dist <= KINDA_SMALL_NUMBER) { continue; }
+
+		const FVector Dir = ToOther / Dist;
+		// 相手が自馬の横〜前方に居るか（後方の相手は攻撃しない）
+		if (FVector::DotProduct(Forward, Dir) < AIAttackForwardDot) { continue; }
+
+		NearestDist = Dist;
+		Target = OtherHorse;
+		TargetSideDot = FVector::DotProduct(Dir, RightVec);
+	}
+
+	if (!Target)
+	{
+		return false;
+	}
+
+	// 相手の居る側へ馬を倒す。UpdateTilt の規約は「Input>0(マウス右)で右へ傾く」。
+	// 相手が右側(SideSign=+1)なら正の Input、左側なら負の Input を与える。
+	// 正面付近(side≈0)は右へ倒す固定バイアスで膠着を防ぐ。
+	constexpr float SideThreshold = 0.05f;
+	const float SideSign = (FMath::Abs(TargetSideDot) < SideThreshold) ? 1.0f : FMath::Sign(TargetSideDot);
+
+	TiltInput = SideSign * AIAttackTiltDrive;
+
+	// 攻撃対象へわずかに寄せる操舵バイアス（接触を作る）
+	OutSteerBias = SideSign * 0.3f;
+	return true;
+}
+
+// =====================================================================
+// AI自ジョッキー回収（落馬したジョッキーへ走行してピックアップ）
+// =====================================================================
+bool AHorseCharacter::UpdateAIRecoverJockey(float DeltaTime)
+{
+	// 自ジョッキーが落馬中（KnockedOut）でなければ回収モードに入らない
+	if (!CurrentJockey || !CurrentJockey->IsKnockedOut())
+	{
+		// 復帰済み → 待機状態をリセット
+		bAIWaitingToRecover = false;
+		AIRecoverDelayTimer = 0.0f;
+		return false;
+	}
+
+	// 攻撃の傾けはしない（回収優先）
+	TiltInput = 0.0f;
+
+	// 落馬を検出した最初のフレームで待機タイマーを開始する。
+	// 即回収だと人間が落馬に気づけないため、AIRecoverDelay 秒の「間」を作る。
+	if (!bAIWaitingToRecover)
+	{
+		bAIWaitingToRecover = true;
+		AIRecoverDelayTimer = AIRecoverDelay;
+	}
+
+	// 待機中はその場で停止（落馬を視認させる）。回収はまだ行わない。
+	if (AIRecoverDelayTimer > 0.0f)
+	{
+		AIRecoverDelayTimer = FMath::Max(0.0f, AIRecoverDelayTimer - DeltaTime);
+		CurrentForwardInput = 0.0f;
+		CurrentRightInput = 0.0f;
+		return true;
+	}
+
+	const FVector CurrentLoc = GetActorLocation();
+	const FVector JockeyLoc = CurrentJockey->GetBodyWorldLocation();
+
+	// ジョッキーへ向けて操舵
+	FVector ToJockey = JockeyLoc - CurrentLoc;
+	ToJockey.Z = 0.0f;
+	if (ToJockey.Normalize())
+	{
+		FVector Forward = GetActorForwardVector();
+		Forward.Z = 0.0f;
+		Forward.Normalize();
+
+		const float Dot = FVector::DotProduct(Forward, ToJockey);
+		const FVector Cross = FVector::CrossProduct(Forward, ToJockey);
+		float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0f, 1.0f)));
+		if (Cross.Z < 0.0f) { AngleDeg = -AngleDeg; }
+
+		CurrentRightInput = FMath::Clamp(AngleDeg / 30.0f, -1.0f, 1.0f);
+
+		// 近づいたら減速して行き過ぎを防ぐ
+		const float Dist = FVector::Dist2D(CurrentLoc, JockeyLoc);
+		CurrentForwardInput = (Dist > PickupRadius * 1.5f) ? 1.0f : 0.4f;
+	}
+	else
+	{
+		CurrentForwardInput = 0.0f;
+		CurrentRightInput = 0.0f;
+	}
+
+	// 範囲内なら拾い上げる（TryPickupJockey が内部で距離・状態を再判定する）
+	TryPickupJockey();
+	return true;
+}
+
+// =====================================================================
+// AI射出（前方の騎乗中の相手へジョッキーを射出して落馬を狙う高リスク技）
+// =====================================================================
+void AHorseCharacter::UpdateAIEject(const TArray<AHorseCharacter*>& OtherHorses)
+{
+	// リザルト演出中・入力ロック中・消極的な個体・クールダウン中・未騎乗なら射出しない
+	if (bExhibitionMode || bInputLocked || AIAggression < AIEjectAggressionThreshold)
+	{
+		return;
+	}
+	if (AIEjectCooldownTimer > 0.0f) { return; }
+	if (!CurrentJockey || !CurrentJockey->IsRiding() || CurrentJockey->IsKnockedOut())
+	{
+		return;
+	}
+
+	// 順位情報が無ければ「奥の手＝先頭馬狙い」を判定できないので射出しない
+	if (!CachedRaceManager) { return; }
+
+	// 順位ゲート: 先頭(1) または未登録(0) は射出しない。2位以下の追走個体のみが奥の手を使う。
+	const int32 SelfRank = CachedRaceManager->GetRankOf(this);
+	if (SelfRank <= 1) { return; }
+
+	// 先頭馬を取得（GetRanking は順位順ソート済みのため先頭が [0]）
+	const TArray<FRaceEntry> Ranking = CachedRaceManager->GetRanking();
+	if (Ranking.Num() == 0) { return; }
+	AHorseCharacter* Leader = Ranking[0].Horse;
+	if (!Leader || Leader == this) { return; }
+
+	// 先頭馬のジョッキーが騎乗中でなければ射出しても落馬させられないので狙わない
+	AJockey* LeaderJockey = Leader->GetCurrentJockey();
+	if (!LeaderJockey || !LeaderJockey->IsRiding() || LeaderJockey->IsKnockedOut())
+	{
+		return;
+	}
+
+	// 先頭馬との水平距離が射程内のときのみ実行（物理的に届く時だけ）
+	const FVector CurrentLoc = GetActorLocation();
+	FVector ToLeader = Leader->GetActorLocation() - CurrentLoc;
+	ToLeader.Z = 0.0f;
+	const float Dist = ToLeader.Size();
+	if (Dist > AIEjectRange || Dist <= KINDA_SMALL_NUMBER) { return; }
+	const FVector AimDir = ToLeader / Dist;
+
+	// 向き補正: 前方ベクトルと先頭馬方向の外積Z符号から、先頭馬側へ操舵バイアスを加える
+	FVector Forward = GetActorForwardVector();
+	Forward.Z = 0.0f;
+	if (Forward.Normalize())
+	{
+		const float CrossZ = FVector::CrossProduct(Forward, AimDir).Z;
+		if (!FMath::IsNearlyZero(CrossZ))
+		{
+			CurrentRightInput = FMath::Clamp(
+				CurrentRightInput + FMath::Sign(CrossZ) * AIEjectAimSteer, -1.0f, 1.0f);
+		}
+	}
+
+	// 先頭馬方向へ射出。以降は自ジョッキーが落馬するため UpdateAIRecoverJockey が回収に移行する。
+	EjectJockey(AimDir);
+	AIEjectCooldownTimer = AIEjectCooldown;
 }
 
 // =====================================================================
@@ -900,6 +1355,38 @@ float AHorseCharacter::NormalizeSplineDistance(float Distance, float SplineLengt
 }
 
 // =====================================================================
+// Possess された瞬間に GhostRecorder を付与する
+// =====================================================================
+void AHorseCharacter::PossessedBy(AController* NewController)
+{
+	Super::PossessedBy(NewController);
+
+	APlayerController* PC = Cast<APlayerController>(NewController);
+	if (!PC) { return; }
+
+	// EnhancedInput の MappingContext を登録する。
+	// BeginPlay 時点ではまだ Possess されていないため、ここで行うのが確実。
+	if (UEnhancedInputLocalPlayerSubsystem* Subsystem =
+		ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PC->GetLocalPlayer()))
+	{
+		if (DefaultMappingContext)
+		{
+			Subsystem->AddMappingContext(DefaultMappingContext, 0);
+		}
+	}
+
+	// PlayerController に Possess された馬にのみ GhostRecorder を付与する。
+	if (!GhostRecorder)
+	{
+		GhostRecorder = NewObject<UGhostRecorder>(this);
+		if (GhostRecorder)
+		{
+			GhostRecorder->RegisterComponent();
+		}
+	}
+}
+
+// =====================================================================
 // レース状態変化ハンドラ
 // =====================================================================
 void AHorseCharacter::HandleRaceStateChanged(ERaceState NewState)
@@ -915,11 +1402,26 @@ void AHorseCharacter::HandleRaceStateChanged(ERaceState NewState)
 		SetInputLocked(false);
 		break;
 	case ERaceState::Finished:
-		SetInputLocked(true);
+		// エキシビション中はリザルト演出のため再ロックしない（走り続ける）
+		if (!bExhibitionMode)
+		{
+			SetInputLocked(true);
+		}
 		break;
 	default:
 		break;
 	}
+}
+
+// =====================================================================
+// エキシビション走行開始（リザルト演出用）
+// =====================================================================
+void AHorseCharacter::StartExhibitionRun()
+{
+	// AI 自律走行を有効化し、入力ロックを解除して走り続けさせる。
+	bExhibitionMode = true;
+	bIsAI = true;
+	SetInputLocked(false);
 }
 
 // =====================================================================
