@@ -6,6 +6,9 @@
 #include "Kismet/GameplayStatics.h"
 #include "Engine/World.h"
 #include "CollisionQueryParams.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
+#include "RaceManager.h"
 
 // =====================================================================
 // コンストラクタ
@@ -99,6 +102,13 @@ void AStartGridSpawner::SpawnGrid()
 		}
 	}
 
+	// 新規スポーンモード時：スポーンした馬をインデックス順に保持し、後で Possess に使う
+	TArray<AHorseCharacter*> SpawnedHorses;
+	if (!bRespawnExisting)
+	{
+		SpawnedHorses.Reserve(GridCount);
+	}
+
 	for (int32 i = 0; i < GridCount; ++i)
 	{
 		// スプライン上の距離（短距離トラックでは末尾を超えないようクランプ）
@@ -146,10 +156,113 @@ void AStartGridSpawner::SpawnGrid()
 			if (HorseClass)
 			{
 				const FVector FinalLoc = ResolveSpawnLocationOnGround(SpawnLocXY, NewSpawnCapsuleHalfHeight, IgnoredActors);
+				const FTransform SpawnTransform(SpawnRot, FinalLoc);
 
 				FActorSpawnParameters Params;
 				Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-				World->SpawnActor<AHorseCharacter>(HorseClass, FinalLoc, SpawnRot, Params);
+
+				AHorseCharacter* NewHorse = nullptr;
+				if (i == PlayerSlotIndex)
+				{
+					// プレイヤー馬は「Possess してから BeginPlay」の順序を保証するため遅延スポーンする。
+					// これにより馬の BeginPlay／HUD 構築時点で既に Possess 済みとなり、
+					// HUD の「Get Owning Player Pawn」で自馬を正しく取得できる（リザルト判定に必須）。
+					NewHorse = World->SpawnActorDeferred<AHorseCharacter>(
+						HorseClass, SpawnTransform, nullptr, nullptr,
+						ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn);
+					if (NewHorse)
+					{
+						if (APlayerController* PC = World->GetFirstPlayerController())
+						{
+							PC->Possess(NewHorse);
+						}
+						NewHorse->FinishSpawning(SpawnTransform);
+					}
+				}
+				else
+				{
+					NewHorse = World->SpawnActor<AHorseCharacter>(HorseClass, FinalLoc, SpawnRot, Params);
+				}
+
+				if (NewHorse)
+				{
+					SpawnedHorses.Add(NewHorse);
+				}
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------
+	// ソロ構成の自動化:
+	// プレイヤーコントローラが所有する馬を「プレイヤー」とみなし、
+	// それ以外の全馬を AI 化して個体差プロファイルを確定する。
+	// （インデックス非依存。レベル直置き／新規スポーンのどちらにも対応）
+	// -----------------------------------------------------------------
+	AssignAIToNonPlayers();
+}
+
+// =====================================================================
+// プレイヤー所有以外の馬を AI 化し、個体差を初期化する
+// =====================================================================
+void AStartGridSpawner::AssignAIToNonPlayers()
+{
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	// プレイヤーコントローラが所有する Pawn を収集
+	TSet<const AActor*> PlayerPawns;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (const APlayerController* PC = It->Get())
+		{
+			if (const APawn* Pawn = PC->GetPawn())
+			{
+				PlayerPawns.Add(Pawn);
+			}
+		}
+	}
+
+	// レベル内の全馬を走査し、プレイヤー所有でなければ AI 化
+	TArray<AActor*> AllHorses;
+	UGameplayStatics::GetAllActorsOfClass(World, AHorseCharacter::StaticClass(), AllHorses);
+	for (AActor* Actor : AllHorses)
+	{
+		AHorseCharacter* Horse = Cast<AHorseCharacter>(Actor);
+		if (!Horse) { continue; }
+		if (PlayerPawns.Contains(Horse)) { continue; } // プレイヤー馬は除外
+
+		Horse->SetAIControlled(true);
+		Horse->InitializeAIProfile();
+
+		// AI 馬に Controller を付与する。
+		// AddMovementInput（前進）は CharacterMovementComponent が処理するが、
+		// CMC は Pawn に Controller が無いと入力加速を適用しない。
+		// 実行時スポーンの馬は AutoPossessAI(Placed in World) の対象外のため、
+		// ここで明示的に既定 AIController を生成して所有させる。
+		if (!Horse->GetController())
+		{
+			Horse->SpawnDefaultController();
+		}
+	}
+
+	// AI 馬の bInputLocked をレースの現在状態と同期する。
+	// Spawner の BeginPlay でスポーンした馬は BeginPlay 時に RaceManager の
+	// 初期状態（Pregame）を受け取っているが、念のり現在の状態を再適用する。
+	// Running 状態ならすぐに動き始め、Pregame/Countdown なら入力ロックを維持する。
+	TArray<AActor*> FoundManagers;
+	UGameplayStatics::GetAllActorsOfClass(World, ARaceManager::StaticClass(), FoundManagers);
+	if (FoundManagers.Num() > 0)
+	{
+		if (const ARaceManager* RM = Cast<ARaceManager>(FoundManagers[0]))
+		{
+			const bool bShouldLock = (RM->RaceState != ERaceState::Running);
+			for (AActor* Actor : AllHorses)
+			{
+				AHorseCharacter* Horse = Cast<AHorseCharacter>(Actor);
+				if (Horse && !PlayerPawns.Contains(Horse))
+				{
+					Horse->SetInputLocked(bShouldLock);
+				}
 			}
 		}
 	}

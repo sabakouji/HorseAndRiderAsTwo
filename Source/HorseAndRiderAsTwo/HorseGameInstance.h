@@ -7,19 +7,23 @@
 /**
  * EAppScene
  * アプリ全体のシーン状態。
- *   Title      : タイトル画面（FrontEnd Level 上のウィジェット）
- *   ModeSelect : ゲームモード選択＝ネットワークルーム画面（FrontEnd Level 上のウィジェット）
+ *   Title      : タイトル画面（FrontEnd Level 上のウィジェット＋始点 FE_Title）
+ *   ModeSelect : ソロ／マルチ分岐の選択画面（FrontEnd Level 上、始点 FE_ModeSelect）
+ *   MultiRoom  : マルチ部屋＝ホスト作成＋パスワード画面（FrontEnd Level 上、
+ *                カメラは動かさず ModeSelect の視点を維持し UI のみ切替）
  *   Race       : メインゲーム（レース Level / Main.umap）
  *   Result     : レースリザルト（レース Level 上のウィジェット）
  *
- * Title / ModeSelect は同一 FrontEnd Level 上でウィジェットを差し替えるだけ（レベルロード無し）。
- * Race への遷移は OpenLevel を伴う。Result はレース Level 上に重ねて表示する。
+ * Title / ModeSelect / MultiRoom は同一 FrontEnd Level 上で「始点（カメラ視点）の変更＋
+ * ウィジェット差し替え」のみで遷移する（レベルロード無し＝シームレス）。
+ * Race への遷移のみ OpenLevel を伴う。Result はレース Level 上に重ねて表示する。
  */
 UENUM(BlueprintType)
 enum class EAppScene : uint8
 {
 	Title      UMETA(DisplayName = "Title"),
 	ModeSelect UMETA(DisplayName = "ModeSelect"),
+	MultiRoom  UMETA(DisplayName = "MultiRoom"),
 	Race       UMETA(DisplayName = "Race"),
 	Result     UMETA(DisplayName = "Result")
 };
@@ -59,9 +63,27 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Scene")
 	void GoToTitle();
 
-	/** モード選択（ネットワークルーム）画面へ遷移する。FrontEnd Level 内のウィジェット差し替え */
+	/**
+	 * モード選択（ソロ／マルチ分岐）画面へ遷移する。
+	 * FrontEnd Level 内の始点変更＋ウィジェット差し替えのみ（OpenLevel 無し）。
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Scene")
 	void GoToModeSelect();
+
+	/**
+	 * ソロを選択する。bIsMultiplayer=false を保持し、即レースを開始する（GoToRace）。
+	 * ソロは部屋を作らないためそのままレース Level へ遷移する。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scene")
+	void GoToSolo();
+
+	/**
+	 * マルチ部屋（ホスト作成＋パスワード）画面へ遷移する。
+	 * bIsMultiplayer=true / bIsHost=true を保持し、FrontEnd Level 内の始点変更＋
+	 * ウィジェット差し替えのみで表示する（OpenLevel 無し）。セッション本体は M7。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scene")
+	void GoToMultiRoom();
 
 	/** レース Level（RaceLevelName）を OpenLevel し、シーンを Race にする */
 	UFUNCTION(BlueprintCallable, Category = "Scene")
@@ -74,6 +96,13 @@ public:
 	/** リザルト等からタイトルへ戻る（FrontEnd Level を OpenLevel し、シーンを Title にする） */
 	UFUNCTION(BlueprintCallable, Category = "Scene")
 	void ReturnToTitle();
+
+	/**
+	 * リザルト等からモード選択へ戻る（FrontEnd Level を OpenLevel し、ModeSelect を表示する）。
+	 * ReturnToTitle と同じ仕組みで、読み込み後に ModeSelect シーンを確定する。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scene")
+	void ReturnToModeSelect();
 
 	/** 現在のシーンを取得する */
 	UFUNCTION(BlueprintCallable, Category = "Scene")
@@ -98,6 +127,10 @@ public:
 	/** 自分がホストか（ルーム作成＝true、参加＝false）。接続本体は M7 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room")
 	bool bIsHost = false;
+
+	/** マルチプレイか（ソロ＝false / マルチ部屋＝true）。spawn 数・接続反映は M7 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Room")
+	bool bIsMultiplayer = false;
 
 	/** FrontEnd（タイトル・モード選択・リザルト遷移元）Level のパス */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scene")

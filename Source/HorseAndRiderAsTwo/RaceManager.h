@@ -9,6 +9,7 @@ class ATrackActor;
 class AHorseCharacter;
 class ACheckpointActor;
 class AGhostPlayer;
+class AIntroCameraDirector;
 
 /**
  * ERaceState
@@ -32,6 +33,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRaceStateChanged, ERaceState, New
 
 /** 順位変動通知。Horse の順位が OldRank から NewRank（いずれも1始まり）へ変化したときに発火 */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnRankChanged, AHorseCharacter*, Horse, int32, NewRank, int32, OldRank);
+
+/** いずれかの馬がゴールした時に発火。BP が「自分の馬か」を判定して GOAL 演出・リザルトを起動する */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnHorseFinished, AHorseCharacter*, Horse);
 
 /**
  * FRaceEntry
@@ -119,6 +123,13 @@ public:
 	void NotifyHorseFinished(AHorseCharacter* Horse);
 
 	/**
+	 * 全参加馬をエキシビション走行（AI 自動周回・入力ロック解除）に切り替える。
+	 * リザルト演出中に背景で全馬を走らせ続けるために BP から呼ぶ。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Race")
+	void StartExhibitionForAll();
+
+	/**
 	 * Goal ライン通過通知（AGoalTrigger から呼ばれる）。
 	 * - 全 Checkpoint を順番通り通過済みであれば LapsCompleted を加算しラップ計測を行う
 	 * - 加算後の LapsCompleted >= TargetLaps であればゴール確定処理を行う
@@ -129,6 +140,10 @@ public:
 	/** 順位順にソートした参加馬一覧を取得 */
 	UFUNCTION(BlueprintCallable, Category = "Race")
 	TArray<FRaceEntry> GetRanking() const { return Ranking; }
+
+	/** 対象 Track を取得（IntroCameraDirector 等から参照） */
+	UFUNCTION(BlueprintCallable, Category = "Race")
+	ATrackActor* GetTrack() const { return Track; }
 
 	/** 指定の馬の現在順位（1始まり、見つからなければ 0） */
 	UFUNCTION(BlueprintCallable, Category = "Race")
@@ -180,6 +195,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Race|UI")
 	FOnRankChanged OnRankChanged;
 
+	/** 馬ゴール通知（BP が自馬判定して GOAL 演出・リザルトを起動する） */
+	UPROPERTY(BlueprintAssignable, Category = "Race")
+	FOnHorseFinished OnHorseFinished;
+
 	/**
 	 * チェックポイント通過通知（ACheckpointActor から呼ばれる）。
 	 * 直前 CP +1 と一致した場合のみ LastCheckpointIndex を更新する。
@@ -223,6 +242,14 @@ protected:
 	/** 生成するゴースト馬の BP クラス（半透明メッシュをアサインした BP_GhostPlayer を指定） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|Ghost")
 	TSubclassOf<AGhostPlayer> GhostPlayerClass;
+
+	/** 開始演出カメラのクラス。未指定なら C++ 既定 AIntroCameraDirector を使用。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|Intro")
+	TSubclassOf<AIntroCameraDirector> IntroCameraDirectorClass;
+
+	/** 演出カメラを起動するまでの遅延秒（馬のスポーン完了を待つ。0 で次フレーム＝初期ビューが演出カメラ）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|Intro", meta = (ClampMin = "0.0"))
+	float IntroStartDelay = 0.0f;
 
 private:
 	/** 参加馬エントリ */
@@ -271,6 +298,12 @@ private:
 
 	/** カウントダウン完了時の内部コールバック（StartRace を呼ぶ） */
 	void OnCountdownFinished();
+
+	/** 演出カメラ起動タイマーのハンドル */
+	FTimerHandle IntroStartTimerHandle;
+
+	/** 演出カメラをスポーンして起動する（馬スポーン完了後に呼ぶ）。失敗時は即カウントダウン。 */
+	void TriggerIntro();
 
 	// =====================================================================
 	// ゴースト記録・再生（M6）

@@ -19,6 +19,21 @@ ACheckpointActor::ACheckpointActor()
 }
 
 // =====================================================================
+// コース幅に合わせてトリガーボックスを構成（横幅連動＋底面化）
+// =====================================================================
+void ACheckpointActor::ConfigureForTrack(float TrackHalfWidth)
+{
+	if (!TriggerBox) { return; }
+
+	FVector Ext = TriggerBox->GetUnscaledBoxExtent();
+	Ext.Y = FMath::Max(1.0f, TrackHalfWidth); // 横幅をコース片側半幅に連動
+	TriggerBox->SetBoxExtent(Ext);
+
+	// 中心を半高ぶん上げ、底面を原点（路面）に揃える（埋没防止）。絶対指定で冪等。
+	TriggerBox->SetRelativeLocation(FVector(0.0f, 0.0f, Ext.Z));
+}
+
+// =====================================================================
 // BeginPlay
 // =====================================================================
 void ACheckpointActor::BeginPlay()

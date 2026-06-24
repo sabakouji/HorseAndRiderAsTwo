@@ -14,7 +14,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogReins, Log, All);
 namespace
 {
 	/** SkeletalMeshComponent から socket が付与されているボーン名を解決する */
-	FName ResolveSocketParentBone(const USkeletalMeshComponent* Mesh, FName SocketOrBone)
+	FName ResolveSocketParentBone_Reins(const USkeletalMeshComponent* Mesh, FName SocketOrBone)
 	{
 		if (!Mesh || SocketOrBone.IsNone()) { return NAME_None; }
 		if (Mesh->GetBoneIndex(SocketOrBone) != INDEX_NONE) { return SocketOrBone; }
@@ -28,7 +28,7 @@ namespace
 	}
 
 	/** PhysicsAsset に対象ボーンの物理ボディが存在するか */
-	static inline bool HasPhysicsBody(const USkeletalMeshComponent* Mesh, FName BoneName)
+	bool HasPhysicsBody_Reins(const USkeletalMeshComponent* Mesh, FName BoneName)
 	{
 		if (!Mesh || BoneName.IsNone()) { return false; }
 		const UPhysicsAsset* PA = Mesh->GetPhysicsAsset();
@@ -276,7 +276,7 @@ void AReins::SetupReinsMesh()
 		for (int32 i = 0; i < NumBones; ++i)
 		{
 			const FName BoneName = RefSkel.GetBoneName(i);
-			const bool bHasBody = HasPhysicsBody(ReinsMesh, BoneName);
+			const bool bHasBody = HasPhysicsBody_Reins(ReinsMesh, BoneName);
 			UE_LOG(LogReins, Log, TEXT("  [%d] '%s' (Body: %s)"),
 				i, *BoneName.ToString(), bHasBody ? TEXT("OK") : TEXT("MISSING"));
 		}
@@ -295,7 +295,7 @@ void AReins::EstablishBridleConstraints()
 		if (!Cst) { return; }
 
 		// ソケットは Constraint API では使えないので、ソケットが付与されたボーン名を解決する
-		const FName HorseBone = ResolveSocketParentBone(CachedHorseMesh, HorseSocketName);
+		const FName HorseBone = ResolveSocketParentBone_Reins(CachedHorseMesh, HorseSocketName);
 		if (HorseBone.IsNone())
 		{
 			UE_LOG(LogReins, Warning,
@@ -305,7 +305,7 @@ void AReins::EstablishBridleConstraints()
 		}
 
 		// PhysicsAsset の物理ボディ有無を検証（無いと Constraint は接続できない）
-		if (!HasPhysicsBody(ReinsMesh, CableBone))
+		if (!HasPhysicsBody_Reins(ReinsMesh, CableBone))
 		{
 			UE_LOG(LogReins, Warning,
 				TEXT("[Reins] Cable PhysicsAsset に '%s' の物理ボディがありません。PhysicsAsset に Body を追加してください。"),
@@ -344,14 +344,14 @@ void AReins::EstablishHandConstraint()
 	if (!HandConstraint) { return; }
 	if (!CachedJockeyMesh || !ReinsMesh) { return; }
 
-	if (!HasPhysicsBody(ReinsMesh, CableHandGripBoneName))
+	if (!HasPhysicsBody_Reins(ReinsMesh, CableHandGripBoneName))
 	{
 		UE_LOG(LogReins, Warning,
 			TEXT("[Reins] Cable PhysicsAsset に '%s' の物理ボディがありません。PhysicsAsset に Body を追加してください。"),
 			*CableHandGripBoneName.ToString());
 		return;
 	}
-	if (!HasPhysicsBody(CachedJockeyMesh, JockeyHandBoneName))
+	if (!HasPhysicsBody_Reins(CachedJockeyMesh, JockeyHandBoneName))
 	{
 		UE_LOG(LogReins, Warning,
 			TEXT("[Reins] Jockey PhysicsAsset に '%s' の物理ボディがありません。"),

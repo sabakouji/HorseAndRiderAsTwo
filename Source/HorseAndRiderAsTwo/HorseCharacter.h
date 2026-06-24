@@ -15,6 +15,7 @@ class UChildActorComponent;
 class ATrackActor;
 class ARaceManager;
 class UGhostRecorder;
+class UAnimalStatsDataAsset;
 struct FInputActionValue;
 enum class ERaceState : uint8;
 
@@ -52,6 +53,27 @@ public:
 	/** AI 制御馬か（ゴースト記録対象判定などに使用） */
 	UFUNCTION(BlueprintCallable, Category = "Race|AI")
 	bool IsAIControlled() const { return bIsAI; }
+
+	/** この馬を AI として有効化する（スポーナからの自動構成用） */
+	UFUNCTION(BlueprintCallable, Category = "Race|AI")
+	void SetAIControlled(bool bEnable) { bIsAI = bEnable; }
+
+	/**
+	 * AI 個体差プロファイルを乱数で確定する（個体値範囲内）。
+	 * bIsAI を true にした後に一度だけ呼ぶ。速度スケール・レーン嗜好・積極性・
+	 * イン取り量を個体ごとに決定し、MoveSpeed へ速度スケールを反映する。
+	 * 二重適用を避けるため内部フラグで一度だけ実行する。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Race|AI")
+	void InitializeAIProfile();
+
+	/**
+	 * リザルト演出用エキシビション走行を開始する。
+	 * AI 自動周回を有効化し入力ロックを解除する。以後 Finished になっても再ロックしないため、
+	 * リザルト中も馬が走り続ける（背景演出用）。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Race|AI")
+	void StartExhibitionRun();
 
 protected:
 	virtual void BeginPlay() override;
@@ -135,15 +157,38 @@ protected:
 	TObjectPtr<UInputAction> BrakeAction;
 
 	/**
-	 * デバッグ振り回しアクション（IA_DebugSwing を割り当てる、Bool 型）。
-	 * 押すたびに振り回しモードを toggle する。
+	 * 傾けアクション（IA_Tilt を割り当てる、Axis1D 型 / マウスX 推奨）。
+	 * マウスの移動量に比例して馬が傾き、鞍のジョッキーを横へ振って相手を攻撃する。
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input|Debug", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInputAction> DebugSwingAction;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UInputAction> TiltAction;
 
 	/** 振り回し時のアンカー: 馬メッシュ上のソケット名 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Swing")
 	FName SwingAnchorSocketName = FName("BridleSocket_L");
+
+	/**
+	 * 傾け入力（マウス移動量）に対する馬の傾き感度 (deg / 入力単位)。
+	 * 小さくすると鈍く、大きくすると敏感に傾く。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HorseTiltSensitivity = 2.0f;
+
+	/** 馬の最大傾き角 (deg)。これ以上は傾かない */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float HeadbangHorseRollAngle = 20.0f;
+
+	/** 傾け入力が無いとき、傾きが中心(0)へ戻る速度 (1/s) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HorseTiltReturnSpeed = 8.0f;
+
+	/** この傾き角 (deg) 以上の間、ジョッキーの接触を攻撃として扱う */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jockey|Attack",
+		meta = (ClampMin = "0.0"))
+	float HorseAttackRollThreshold = 12.0f;
 
 	// =====================================================================
 	// 物理パラメータ（エディタで数値調整可能）
@@ -167,7 +212,19 @@ protected:
 	FName SimulateBelowBoneName = FName("pelvis");
 
 	// =====================================================================
-	// 移動パラメータ（エディタで数値調整可能）
+	// 動物パラメータ（DataAsset 駆動）
+	// =====================================================================
+
+	/**
+	 * 動物の挙動パラメータ（速度・ダッシュ・旋回・ブレーキ・射出・スタミナ）。
+	 * 割り当てると BeginPlay の ApplyAnimalStats() で以下の各フィールドへ反映される。
+	 * 未割当時は各フィールドの既定値でフォールバックする。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animal")
+	TObjectPtr<UAnimalStatsDataAsset> AnimalStats;
+
+	// =====================================================================
+	// 移動パラメータ（エディタで数値調整可能 / AnimalStats 割当時は上書きされる）
 	// =====================================================================
 
 	/** 最高移動速度 (cm/s) */
@@ -179,6 +236,11 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement",
 		meta = (ClampMin = "0.0"))
 	float TurnSpeed = 100.0f;
+
+	/** 通常時の加速度 (cm/s^2)。CharacterMovement の MaxAcceleration に反映 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement",
+		meta = (ClampMin = "0.0"))
+	float MaxAcceleration = 2048.0f;
 
 	/** カメラブームの長さ (cm) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera",
@@ -194,20 +256,62 @@ protected:
 		meta = (ClampMin = "1.0"))
 	float DashSpeedMultiplier = 2.0f;
 
+	/** ダッシュ中の加速度倍率。MaxAcceleration に乗算して反映 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Dash",
+		meta = (ClampMin = "1.0"))
+	float DashAccelerationMultiplier = 1.5f;
+
+	/** ブレーキ時の減速度 (cm/s^2)。大きいほど短距離で止まる */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Dash",
+		meta = (ClampMin = "0.0"))
+	float BrakingDeceleration = 4096.0f;
+
 	/** 射出を許可する最低速度 (cm/s) ? これ未満では急ブレーキしても射出しない */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Dash",
 		meta = (ClampMin = "0.0"))
 	float MinSpeedToEject = 600.0f;
 
-	/** ジョッキー射出時の前方向初速 (cm/s) */
+	/** ジョッキー射出時の前方向初速 (cm/s)。飛距離を決める */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Dash",
 		meta = (ClampMin = "0.0"))
-	float EjectForwardSpeed = 1500.0f;
+	float EjectForwardSpeed = 2000.0f;
 
-	/** ジョッキー射出時の上方向初速 (cm/s)（山なり軌道用） */
+	/** ジョッキー射出時の上方向初速 (cm/s)。小さいほど低弾道でカメラ内に収まる */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Dash",
 		meta = (ClampMin = "0.0"))
-	float EjectUpSpeed = 800.0f;
+	float EjectUpSpeed = 250.0f;
+
+	// =====================================================================
+	// スタミナ（ダッシュ持続制限 / AnimalStats 割当時は上書きされる）
+	// =====================================================================
+
+	/** スタミナ最大値 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Stamina",
+		meta = (ClampMin = "0.0"))
+	float StaminaMax = 100.0f;
+
+	/** ダッシュ中の毎秒スタミナ消費量 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Stamina",
+		meta = (ClampMin = "0.0"))
+	float StaminaDrainPerSec = 25.0f;
+
+	/** 非ダッシュ時の毎秒スタミナ回復量 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Stamina",
+		meta = (ClampMin = "0.0"))
+	float StaminaRegenPerSec = 15.0f;
+
+	/** ダッシュ終了後、回復が始まるまでの猶予時間 (秒) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Stamina",
+		meta = (ClampMin = "0.0"))
+	float StaminaRegenDelay = 1.0f;
+
+	/** 現在のスタミナ残量（実行時。BeginPlay で StaminaMax に初期化） */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Movement|Stamina")
+	float CurrentStamina = 100.0f;
+
+	/** スタミナ残量を画面にデバッグ表示する */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Stamina")
+	bool bShowStaminaDebug = true;
 
 	// =====================================================================
 	// Jockey / Reins （ChildActorComponent 方式）
@@ -259,6 +363,10 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI")
 	bool bIsAI = false;
 
+	/** エキシビション走行中か。true の間は Finished になっても入力ロックしない（リザルト中も走り続ける） */
+	UPROPERTY(BlueprintReadOnly, Category = "Race|AI")
+	bool bExhibitionMode = false;
+
 	/** AIが追従走行する際のスプライン上の先行目標距離(cm) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI", meta = (EditCondition = "bIsAI"))
 	float LookaheadDistance = 600.0f;
@@ -278,6 +386,113 @@ protected:
 	/** 曲率推定のためのLookahead前後サンプリング間隔(cm)。±CurvatureSampleStepの2点でTangentを取り差分する */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI", meta = (EditCondition = "bIsAI", ClampMin = "1.0"))
 	float CurvatureSampleStep = 200.0f;
+
+	// ---------------------------------------------------------------------
+	// 位置取り（ライン取り）パラメータ
+	// ---------------------------------------------------------------------
+
+	/** コース幅(片側半幅)に対して横方向に取れる最大オフセット比率(0〜1)。個体レーン嗜好の振れ幅。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Line", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AILaneSpreadMax = 0.7f;
+
+	/** コーナーで内側へ寄せる最大比率(0〜1)。曲率に比例してイン側へ寄る。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Line", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AICornerCutMax = 0.6f;
+
+	/** 横オフセット時にコース端から確保する余白(cm)。コースアウト防止。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Line", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AILaneEdgeMargin = 150.0f;
+
+	// ---------------------------------------------------------------------
+	// 個体差（個体値）範囲パラメータ
+	// ---------------------------------------------------------------------
+
+	/** 個体速度スケールの下限（MoveSpeed に乗算） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Individual", meta = (EditCondition = "bIsAI", ClampMin = "0.1", ClampMax = "2.0"))
+	float AISpeedScaleMin = 0.92f;
+
+	/** 個体速度スケールの上限（MoveSpeed に乗算） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Individual", meta = (EditCondition = "bIsAI", ClampMin = "0.1", ClampMax = "2.0"))
+	float AISpeedScaleMax = 1.06f;
+
+	/** 個体積極性(ダッシュ/攻撃の発火しやすさ)の下限(0〜1) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Individual", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIAggressionMin = 0.25f;
+
+	/** 個体積極性(ダッシュ/攻撃の発火しやすさ)の上限(0〜1) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Individual", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIAggressionMax = 1.0f;
+
+	/** Lookahead 距離に与える個体ジッタの最大量(cm)。±この範囲で個体ごとにずらす。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Individual", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AILookaheadJitter = 200.0f;
+
+	// ---------------------------------------------------------------------
+	// ダッシュAI パラメータ
+	// ---------------------------------------------------------------------
+
+	/** この曲率係数(0〜1)未満の直線でのみダッシュを許可する */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Dash", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIDashCurvatureMax = 0.2f;
+
+	/** 前方クリア判定: 前方コーン内の他馬がこの距離(cm)以内に居ればダッシュ不可 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Dash", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AIDashForwardClearDist = 500.0f;
+
+	/** ダッシュを許可する最低スタミナ比率(0〜1) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Dash", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIDashMinStaminaRatio = 0.35f;
+
+	/** ダッシュ発火に必要な個体積極性のしきい値(これ未満の個体はダッシュしない) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Dash", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIDashAggressionThreshold = 0.3f;
+
+	// ---------------------------------------------------------------------
+	// 攻撃AI（ヘッドバング）パラメータ
+	// ---------------------------------------------------------------------
+
+	/** 攻撃を狙う相手ジョッキー探索半径(cm) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Attack", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AIAttackRadius = 350.0f;
+
+	/** 相手が自馬の横〜前方に居るとみなす前方内積しきい値(-1〜1)。大きいほど正面寄りのみ攻撃。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Attack", meta = (EditCondition = "bIsAI", ClampMin = "-1.0", ClampMax = "1.0"))
+	float AIAttackForwardDot = -0.2f;
+
+	/** 攻撃時に TiltInput へ書き込む仮想マウス値(毎フレーム)。馬ロールを攻撃側へ倒す強さ。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Attack", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AIAttackTiltDrive = 8.0f;
+
+	/** 攻撃発火に必要な個体積極性のしきい値(これ未満の個体は攻撃しない) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Attack", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIAttackAggressionThreshold = 0.4f;
+
+	// ---------------------------------------------------------------------
+	// 射出AI（ジョッキーを前方へ射出し着地爆発で相手を落馬させる高リスク技）
+	// ---------------------------------------------------------------------
+
+	/** 前方この距離(cm)以内に騎乗中の相手が居れば射出を狙う */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Eject", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AIEjectRange = 1500.0f;
+
+	/** 射出発火に必要な個体積極性のしきい値(高めに設定し、攻撃的な個体のみ使う) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Eject", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIEjectAggressionThreshold = 0.7f;
+
+	/** 射出後の再発火までのクールダウン(秒)。連発を防ぐ */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Eject", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AIEjectCooldown = 8.0f;
+
+	/** 射出時に先頭馬方向へ向ける操舵バイアスの強さ(0で補正なし、1で最大) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI|Eject", meta = (EditCondition = "bIsAI", ClampMin = "0.0", ClampMax = "1.0"))
+	float AIEjectAimSteer = 0.5f;
+
+	/**
+	 * 自ジョッキーが落馬してから AI が回収を開始するまでの待機時間(秒)。
+	 * 即回収だと人間が落馬に気づけないため、この間は AI をその場で停止させて「間」を作る。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Race|AI", meta = (EditCondition = "bIsAI", ClampMin = "0.0"))
+	float AIRecoverDelay = 2.0f;
 
 	/** コースアウトと判定するスプラインからの最大許容距離(cm)。
 	 *  M5 以降は ATrackActor::PointWidths（GetWidthAtDistance）が実際の許容幅を供給するため、
@@ -315,6 +530,9 @@ public:
 	UFUNCTION()
 	void HandleRaceStateChanged(ERaceState NewState);
 
+	/** PlayerController に Possess されたタイミングで GhostRecorder を付与する */
+	virtual void PossessedBy(AController* NewController) override;
+
 protected:
 
 	/** スプライン（コース）への参照 */
@@ -343,6 +561,46 @@ private:
 
 	/** AI自動走行の入力更新 */
 	void UpdateAIControl(float DeltaTime);
+
+	/** AIダッシュ判断（直線・前方クリア・スタミナ・積極性で発火） */
+	void UpdateAIDash(float CurvatureAlpha, const TArray<AHorseCharacter*>& OtherHorses);
+
+	/**
+	 * AI攻撃判断（近接した相手ジョッキーへヘッドバングを狙う）。
+	 * 攻撃対象に交戦中は true を返し、寄せる操舵バイアス符号を OutSteerBias に出力する。
+	 */
+	bool UpdateAIAttack(const TArray<AHorseCharacter*>& OtherHorses, float& OutSteerBias);
+
+	/**
+	 * AI自ジョッキー回収判断。自ジョッキーが落馬中なら、AIRecoverDelay 秒の待機後に
+	 * ジョッキー位置へ走行し範囲内でピックアップする。待機中はその場で停止する。
+	 * 回収モード（待機含む）中は true を返し、呼び出し側は通常レース挙動を停止する。
+	 */
+	bool UpdateAIRecoverJockey(float DeltaTime);
+
+	/** AI射出判断（前方の騎乗中の相手へジョッキーを射出する） */
+	void UpdateAIEject(const TArray<AHorseCharacter*>& OtherHorses);
+
+	/** 射出クールダウンの残り時間(秒) */
+	float AIEjectCooldownTimer = 0.0f;
+
+	/** 落馬回収の待機残り時間(秒)。落馬検出時に AIRecoverDelay で初期化される */
+	float AIRecoverDelayTimer = 0.0f;
+
+	/** 落馬回収の待機中フラグ（待機タイマーの多重開始を防ぐ） */
+	bool bAIWaitingToRecover = false;
+
+	// --- AI個体差プロファイル（InitializeAIProfile で確定する実行時値） ---
+	/** 個体プロファイル適用済みフラグ（二重適用防止） */
+	bool bAIProfileInitialized = false;
+	/** 個体レーン嗜好（-1=左端寄り / +1=右端寄り） */
+	float AILanePreference = 0.0f;
+	/** 個体コーナーイン取り量（0〜AICornerCutMax） */
+	float AICornerCut = 0.0f;
+	/** 個体積極性（0〜1） */
+	float AIAggression = 0.5f;
+	/** 個体 Lookahead 加算ジッタ(cm) */
+	float AILookaheadOffset = 0.0f;
 
 	/** スプライン距離をコース種別(ClosedLoop=Fmod / 非Loop=Clamp)に応じて正規化する */
 	float NormalizeSplineDistance(float Distance, float SplineLength, bool bClosed) const;
@@ -380,21 +638,51 @@ private:
 	/** E キー: 落馬ジョッキーを再騎乗させる */
 	void TryPickupJockey();
 
+	/** AnimalStats（割当時）の値を各フィールド・CharacterMovement へ反映 */
+	void ApplyAnimalStats();
+
+	/** スタミナの消費・回復を更新し、枯渇時はダッシュを強制終了する */
+	void UpdateStamina(float DeltaTime);
+
+	/** ダッシュ終了後の回復開始までの経過時間 (秒) */
+	float StaminaRegenElapsed = 0.0f;
+
 	/** ダッシュ入力 (Triggered/Completed) */
 	void DashStarted();
 	void DashCompleted();
 
-	/** ブレーキ入力 (Triggered) ? ダッシュ中ならジョッキー射出 */
+	/** ブレーキ入力 (Started) ? ダッシュ中ならジョッキー射出、ブレーキ減速を開始 */
 	void BrakePressed();
+
+	/** ブレーキ入力 (Completed) ? ブレーキ減速を終了 */
+	void BrakeReleased();
+
+	/** ブレーキ中フラグ。Tick で BrakingDeceleration による減速を適用 */
+	bool bBraking = false;
 
 	/** ジョッキーを前方放物線で射出する */
 	void EjectJockey();
 
-	/** デバッグ: 振り回しモードを toggle */
-	void ToggleDebugSwing();
+	/** ジョッキーを指定方向(水平)＋上方の放物線で射出する */
+	void EjectJockey(const FVector& WorldAimDir);
 
-	/** デバッグ: Enter キーで RaceManager のカウントダウン開始を発火する */
-	void DebugStartRace();
+	/** 傾け入力 (Triggered) ? Axis1D 値を保持 */
+	void TiltTriggered(const FInputActionValue& Value);
+
+	/** 傾け入力 (Completed) ? 入力を 0 に戻す */
+	void TiltReleased();
+
+	/** 傾け入力の角速度を監視し、素早い傾けでジョッキーのヘッドバンキング攻撃を発動する */
+	void UpdateTilt(float DeltaTime);
+
+	/** 傾け入力（マウス移動量＝1フレーム分のデルタ）。消費後 0 に戻す */
+	float TiltInput = 0.0f;
+
+	/** 馬ロールの現在角 (deg) */
+	float CurrentHorseRoll = 0.0f;
+
+	/** 馬メッシュの既定相対回転（ロールのベースとしてキャッシュ） */
+	FRotator DefaultMeshRelRot = FRotator::ZeroRotator;
 
 	/** ダッシュ中フラグ */
 	bool bIsDashing = false;

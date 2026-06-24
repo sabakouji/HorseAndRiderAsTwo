@@ -4,6 +4,7 @@
 #include "CheckpointActor.h"
 #include "GoalTrigger.h"
 #include "GhostPlayer.h"
+#include "IntroCameraDirector.h"
 #include "Components/SplineComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/World.h"
@@ -29,6 +30,54 @@ void ARaceManager::BeginPlay()
 	ResolveTrack();
 	CollectHorses();
 	SetState(ERaceState::Pregame);
+
+	// 馬のスポーン（StartGridSpawner）と Possess の完了を待ってから演出カメラを起動する。
+	// Delay が 0 のときは SetTimer(rate=0) がタイマーをクリアして発火しないため、
+	// 次フレーム実行（SetTimerForNextTick）を使う。
+	if (UWorld* World = GetWorld())
+	{
+		const float Delay = FMath::Max(0.0f, IntroStartDelay);
+		if (Delay <= 0.0f)
+		{
+			World->GetTimerManager().SetTimerForNextTick(this, &ARaceManager::TriggerIntro);
+		}
+		else
+		{
+			World->GetTimerManager().SetTimer(
+				IntroStartTimerHandle, this, &ARaceManager::TriggerIntro, Delay, false);
+		}
+	}
+}
+
+// =====================================================================
+// 演出カメラ起動（馬スポーン完了後）
+// =====================================================================
+void ARaceManager::TriggerIntro()
+{
+	// 演出前に最新の Track / 馬を確定
+	ResolveTrack();
+	CollectHorses();
+
+	UWorld* World = GetWorld();
+	if (World && RaceState == ERaceState::Pregame)
+	{
+		UClass* DirClass = IntroCameraDirectorClass
+			? IntroCameraDirectorClass.Get()
+			: AIntroCameraDirector::StaticClass();
+
+		FActorSpawnParameters Params;
+		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		if (AIntroCameraDirector* Director =
+			World->SpawnActor<AIntroCameraDirector>(DirClass, FTransform::Identity, Params))
+		{
+			// 演出完了時に Director 側から StartCountdown() が呼ばれる
+			Director->StartIntro(this);
+			return;
+		}
+	}
+
+	// スポーン不可・状態不正などのフォールバック：従来通り即カウントダウン
+	StartCountdown();
 }
 
 // =====================================================================
@@ -524,6 +573,10 @@ void ARaceManager::NotifyHorseFinished(AHorseCharacter* Horse)
 		E.FinishRank = NextFinishRank++;
 		E.FinishTime = (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f) - RaceStartTime;
 
+		// ゴールした瞬間にプレイヤー操作 → AI 自動周回へ即座に切り替える。
+		// （リザルト演出の Delay を待たず、ゴール瞬間に AI パイロット化して止まらせない）
+		Horse->StartExhibitionRun();
+
 		if (GEngine)
 		{
 			const FString Msg = FString::Printf(
@@ -533,6 +586,9 @@ void ARaceManager::NotifyHorseFinished(AHorseCharacter* Horse)
 		}
 
 		UpdateRanking();
+
+		// 馬ゴール通知（BP が自馬判定して GOAL 演出・リザルトを起動する）
+		OnHorseFinished.Broadcast(Horse);
 
 		// 全 Entry がゴール済みになったら Finished へ遷移
 		bool bAllFinished = (Entries.Num() > 0);
@@ -545,6 +601,20 @@ void ARaceManager::NotifyHorseFinished(AHorseCharacter* Horse)
 			SetState(ERaceState::Finished);
 		}
 		return;
+	}
+}
+
+// =====================================================================
+// 全参加馬をエキシビション走行（AI 自動周回・入力ロック解除）に切替
+// =====================================================================
+void ARaceManager::StartExhibitionForAll()
+{
+	for (FRaceEntry& E : Entries)
+	{
+		if (E.Horse)
+		{
+			E.Horse->StartExhibitionRun();
+		}
 	}
 }
 

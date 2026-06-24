@@ -1,6 +1,8 @@
 ﻿#include "HorseGameInstance.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/World.h"
+#include "TimerManager.h"
+#include "GameFramework/PlayerController.h"
 
 UHorseGameInstance::UHorseGameInstance()
 {
@@ -46,12 +48,38 @@ void UHorseGameInstance::GoToTitle()
 
 void UHorseGameInstance::GoToModeSelect()
 {
+	// ソロ／マルチ分岐画面。同一 Level 内の始点変更＋ウィジェット差し替えのみ。
 	SetScene(EAppScene::ModeSelect);
+}
+
+void UHorseGameInstance::GoToSolo()
+{
+	// ソロは部屋を作らず即レース開始。
+	bIsMultiplayer = false;
+	bIsHost = false;
+	GoToRace();
+}
+
+void UHorseGameInstance::GoToMultiRoom()
+{
+	// マルチ部屋（ホスト作成＋パスワード）。セッション本体は M7、ここでは入力窓と遷移のみ。
+	bIsMultiplayer = true;
+	bIsHost = true;
+	SetScene(EAppScene::MultiRoom);
 }
 
 void UHorseGameInstance::GoToRace()
 {
 	SetScene(EAppScene::Race);
+
+	// メニューの UIOnly 入力モードは GameViewportClient に残存し、
+	// レースレベルでもゲーム入力が無視されたままになるため、出る前に GameOnly へ戻す。
+	if (APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0))
+	{
+		PC->SetInputMode(FInputModeGameOnly());
+		PC->bShowMouseCursor = false;
+	}
+
 	UGameplayStatics::OpenLevel(this, RaceLevelName);
 }
 
@@ -67,9 +95,35 @@ void UHorseGameInstance::ReturnToTitle()
 	UGameplayStatics::OpenLevel(this, FrontEndLevelName);
 }
 
+void UHorseGameInstance::ReturnToModeSelect()
+{
+	// FrontEnd Level 読み込み後に ModeSelect を表示させるため、先に意図を仕込む。
+	PendingFrontEndScene = EAppScene::ModeSelect;
+	UGameplayStatics::OpenLevel(this, FrontEndLevelName);
+}
+
 void UHorseGameInstance::ApplyPendingFrontEndScene()
 {
-	// SetScene は差分のみ通知するため、確実に通知が走るよう一旦内部状態を更新してから発火する。
+	// CurrentScene は同期で確定する（Widget の Construct で GetCurrentScene() が正しく読めるように）。
 	CurrentScene = PendingFrontEndScene;
-	OnAppSceneChanged.Broadcast(CurrentScene);
+
+	// 通知は次フレームへ遅延する。
+	// Level 読み込み直後（GameMode::BeginPlay）の時点では FrontEnd の WBP_FrontEndRoot が
+	// まだ生成・バインドされておらず、即時 Broadcast だと取りこぼす
+	// （Title のまま残り ModeSelect が出ない）。次フレームなら確実に届く。
+	if (UWorld* World = GetWorld())
+	{
+		TWeakObjectPtr<UHorseGameInstance> WeakThis(this);
+		World->GetTimerManager().SetTimerForNextTick([WeakThis]()
+		{
+			if (UHorseGameInstance* Self = WeakThis.Get())
+			{
+				Self->OnAppSceneChanged.Broadcast(Self->CurrentScene);
+			}
+		});
+	}
+	else
+	{
+		OnAppSceneChanged.Broadcast(CurrentScene);
+	}
 }
